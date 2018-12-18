@@ -1,0 +1,17 @@
+[package]
+name = "rust-condest"
+version = "0.1.0"
+authors = ["Richard Janis Goldschmidt <janis.beckert@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+cblas = "0.2"
+lapacke = "0.2"
+ndarray = "0.12"
+ndarray-rand = "0.9"
+ordered-float = "1.0"
+rand = "0.6"
+
+# Replace xorshift by xoshiro once it lands
+rand_xorshift = "0.1"
+# rand_xoshiro = "0.1"
