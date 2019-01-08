@@ -10,10 +10,7 @@ lapacke = "0.2"
 ndarray = "0.12"
 ordered-float = "1.0"
 rand = "0.6"
-
-# Replace xorshift by xoshiro once it lands
-rand_xorshift = "0.1"
-# rand_xoshiro = "0.1"
+rand_xoshiro = "0.1"
 
 [dev-dependencies]
 ndarray-rand = "0.9"

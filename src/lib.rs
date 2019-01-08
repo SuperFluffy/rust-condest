@@ -17,7 +17,7 @@ use rand::{
     Rng,
     SeedableRng,
 };
-use rand_xorshift::XorShiftRng;
+use rand_xoshiro::Xoshiro256StarStar;
 use std::collections::BTreeSet;
 use std::cmp;
 use std::slice;
@@ -39,7 +39,7 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 
     let mut thread_rng = rand::thread_rng();
     // TODO: Exchange for xoshiro, once it's merged into rust-rand
-    let mut rng = XorShiftRng::from_rng(&mut thread_rng).expect("Rng initialization failed.");
+    let mut rng = Xoshiro256StarStar::from_rng(&mut thread_rng).expect("Rng initialization failed.");
     let sample = [-1., 1.0];
 
     let mut sign_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
@@ -743,7 +743,7 @@ mod tests {
         SeedableRng,
     };
     use rand::distributions::StandardNormal;
-    use rand_xorshift::XorShiftRng;
+    use rand_xoshiro::Xoshiro256Plus;
 
     #[test]
     /// This performs tests inspired by Table 3 of [Higham and Tisseur].
@@ -764,7 +764,7 @@ mod tests {
         let mut calculated = Vec::with_capacity(nsamples);
         let mut expected = Vec::with_capacity(nsamples);
 
-        let mut rng = XorShiftRng::seed_from_u64(1234);
+        let mut rng = Xoshiro256Plus::seed_from_u64(1234);
         let distribution = StandardNormal;
 
         for _ in 0..nsamples {
