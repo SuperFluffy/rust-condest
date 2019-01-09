@@ -15,7 +15,7 @@ to `normest1`. It does not currently yield the vectors necessary to calculate th
 condition number. This isn't hard to do, but needs to be implemented... Outstanding are:
 
 + [ ] Return vectors required for calculating the 1-norm;
-+ [ ] Create a struct holding the necessary temporaries to repeatedly call `normest1` without extra allocation.
++ [x] Create a struct holding the necessary temporaries to repeatedly call `normest1` without extra allocation.
 + [ ] Implement extra tests to mimic the numerical experiments in [Higham and Tisseur].
 + [ ] Make some nice docs.
 
@@ -24,6 +24,11 @@ condition number. This isn't hard to do, but needs to be implemented... Outstand
 The example below generates a random matrix `a` and estimates its 1-norm. On average, this gives
 pretty good results. Of course, there are some matrices where this algorithm severely underestimates
 the actual 1-norm. See [Higham and Tisseur] for more.
+
+**Important:** You need to explicitly link to a BLAS + LAPACK provider such as `openblas_src`.
+See the explanations given at the [`blas-lapack-rs` organization].
+
+[`blas-lapack-rs` organization]: https://github.com/blas-lapack-rs/blas-lapack-rs.github.io/wiki
 
 ```rust
 extern crate openblas_src; // Need to declare `openblas_src` (or some other BLAS provider) explicitly to link to a BLAS library.

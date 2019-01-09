@@ -1,8 +1,14 @@
 [package]
-name = "rust-condest"
+name = "condest"
 version = "0.1.0"
 authors = ["Richard Janis Goldschmidt <janis.beckert@gmail.com>"]
 edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/superluffy/rust-condest"
+description = "An implementation of the 1-norm and condition number estimator by Higham and Tisseur, 2000"
+
+categories = ["science"]
+keywords = ["condition", "linalg", "matrix", "ndarray", "norm"]
 
 [dependencies]
 cblas = "0.2"
