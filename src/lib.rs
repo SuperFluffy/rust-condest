@@ -37,6 +37,7 @@ pub struct Normest1 {
     indices: Vec<usize>,
     indices_history: BTreeSet<usize>,
     h: Vec<NotNan<f64>>,
+    layout: cblas::Layout,
 }
 
 impl Normest1 {
@@ -59,6 +60,8 @@ impl Normest1 {
 
         let h = vec![unsafe { NotNan::unchecked_new(0.0) }; n];
 
+        let layout = cblas::Layout::RowMajor;
+
         Normest1 {
             n,
             t,
@@ -73,7 +76,249 @@ impl Normest1 {
             indices,
             indices_history,
             h,
+            layout,
         }
+    }
+
+    pub fn calculate<S>(&mut self, a_matrix: &ArrayBase<S, Ix2>, itmax: usize) -> f64
+        where S: Data<Elem=f64>,
+    {
+        if let Some(layout) = array_layout(&a_matrix) {
+            assert_eq!(layout, self.layout, "normest1 is currently only defined for row major matrices");
+        } else {
+            panic!("normest1 is currently only defined for contiguous, row-major matrices");
+        }
+        assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
+        let (n_rows, n_cols) = a_matrix.dim();
+        assert_eq!(n_rows, n_cols, "normest1 is only defined for for square matrices");
+        assert_eq!(n_rows, self.n);
+
+        let n = self.n;
+        let t = self.t;
+
+        let sample = [-1., 1.0];
+
+        // “We now explain our choice of starting matrix. We take the first column of X to be the
+        // vector of 1s, which is the starting vector used in Algorithm 2.1. This has the advantage
+        // that for a matrix with nonnegative elements the algorithm converges with an exact estimate
+        // on the second iteration, and such matrices arise in applications, for example as a
+        // stochastic matrix or as the inverse of an M -matrix.”
+        //
+        // “The remaining columns are chosen as rand {− 1 , 1 } , with a check for and correction of
+        // parallel columns, exactly as for S in the body of the algorithm. We choose random vectors
+        // because it is difficult to argue for any particular fixed vectors and because randomness
+        // lessens the importance of counterexamples (see the comments in the next section).”
+        {
+            let rng_mut = &mut self.rng;
+            self.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())]);
+            self.x_matrix.column_mut(0).fill(1.);
+        }
+
+        // Resample the x_matrix to make sure no columns are parallel
+        find_parallel_columns_in(&self.x_matrix, &mut self.y_matrix, &mut self.column_is_parallel);
+        for (i, is_parallel) in self.column_is_parallel.iter().enumerate() {
+            if *is_parallel {
+                resample_column(&mut self.x_matrix, i, &mut self.rng, &sample);
+            }
+        }
+
+        // Set all columns to unit vectors
+        self.x_matrix.mapv_inplace(|x| x / n as f64);
+
+        let mut estimate = 0.0;
+        let mut best_index = 0;
+
+        'optimization_loop: for k in 0..itmax {
+            // Y = A X
+            {
+                let (a_slice, _) = as_slice_with_layout(&a_matrix).expect("Matrix `a` not contiguous.");
+                let (x_slice, _) = as_slice_with_layout(&self.x_matrix).expect("Matrix `x` not contiguous.");
+                let (y_slice, _) = as_slice_with_layout_mut(&mut self.y_matrix).expect("Matrix `y` not contiguous.");
+                unsafe {
+                    cblas::dgemm(
+                        self.layout,
+                        cblas::Transpose::None,
+                        cblas::Transpose::None,
+                        n as i32,
+                        t as i32,
+                        n as i32,
+                        1.0,
+                        a_slice,
+                        n as i32,
+                        x_slice,
+                        t as i32,
+                        0.0,
+                        y_slice,
+                        t as i32,
+                    )
+                }
+            }
+
+            // est = max{‖Y(:,j)‖₁ : j = 1:t}
+            let (max_norm_index, max_norm) = matrix_onenorm_with_index(&self.y_matrix);
+
+            // if est > est_old or k=2
+            if max_norm > estimate || k == 1 {
+                // ind_best = indⱼ where est = ‖Y(:,j)‖₁, w = Y(:, ind_best)
+                estimate = max_norm;
+                best_index = self.indices[max_norm_index];
+                self.w_vector.assign(&self.y_matrix.column(max_norm_index));
+            } else if k > 1 && max_norm <= estimate {
+                break 'optimization_loop
+            }
+
+            if k >= itmax {
+                break 'optimization_loop
+            }
+
+            // > est_old = est, Sold = S
+            // NOTE: We don't “save” the old estimate, because we are using max_norm as another name
+            // for the new estimate instead of overwriting/reusing est.
+            self.sign_matrix_old.assign(&self.sign_matrix);
+
+            // S = sign(Y)
+            assign_signum_of_array(
+                &self.y_matrix,
+                &mut self.sign_matrix
+            );
+
+            // TODO: Combine the test checking for parallelity between _all_ columns between S
+            // and S_old with the “if t > 1” test below.
+            //
+            // > If every column of S is parallel to a column of Sold, goto (6), end
+            //
+            // NOTE: We are reusing `y_matrix` here as a temporary value.
+            if are_all_columns_parallel_between(&self.sign_matrix_old, &self.sign_matrix, &mut self.y_matrix) {
+                break 'optimization_loop;
+            }
+
+            // FIXME: Is an explicit if condition here necessary?
+            if t > 1 {
+                // > Ensure that no column of S is parallel to another column of S
+                // > or to a column of Sold by replacing columns of S by rand{-1,+1}
+                //
+                // NOTE: We are reusing `y_matrix` here as a temporary value.
+                resample_parallel_columns(
+                    &mut self.sign_matrix,
+                    &self.sign_matrix_old,
+                    &mut self.y_matrix,
+                    &mut self.column_is_parallel,
+                    &mut self.rng,
+                    &sample,
+                );
+            }
+
+            // Z = A^T S
+            let (a_slice, _) = as_slice_with_layout(&a_matrix).expect("Matrix `a` is not contiguous.");
+            let (sign_slice, _) = as_slice_with_layout(&self.sign_matrix).expect("Matrix `sign` is not contiguous.");
+            let (z_slice, _) = as_slice_with_layout_mut(&mut self.z_matrix).expect("Matrix `z` is not contiguous.");
+            // NOTE: In RowMajor order, f77 dgemm sees all matrices as their transpose. Hence, the
+            // wrapper cblas::dgemm executes C = A B as C^T = B^T A^T. The arguments below have to be
+            // adjusted accordingly.
+            unsafe {
+                cblas::dgemm(
+                    self.layout,
+                    cblas::Transpose::Ordinary,
+                    cblas::Transpose::None,
+                    n as i32, // Number of rows of Op(a)
+                    t as i32, // Number of columns of Op(b)
+                    n as i32,
+                    1.0,
+                    a_slice,
+                    n as i32,
+                    sign_slice,
+                    t as i32,
+                    0.0,
+                    z_slice,
+                    t as i32,
+                )
+            }
+
+            // hᵢ= ‖Z(i,:)‖_∞
+            let mut max_h = 0.0;
+            for (row, h_element) in self.z_matrix.genrows().into_iter().zip(self.h.iter_mut()) {
+                let h = vector_maxnorm(&row);
+                max_h = if h > max_h { h } else { max_h };
+                // Convert f64 to NotNan for using sort_unstable_by below
+                *h_element = h.into();
+            }
+
+            // TODO: This test for equality needs an approximate equality test instead.
+            if k > 0 && max_h == self.h[best_index].into() {
+                break 'optimization_loop
+            }
+
+            // > Sort h so that h_1 >= ... >= h_n and re-order correspondingly.
+            // NOTE: h itself doesn't need to be reordered. Only the order of
+            // the indices is relevant.
+            {
+                let h_ref = &self.h;
+                self.indices.sort_unstable_by(|i, j| h_ref[*j].cmp(&h_ref[*i]));
+            }
+
+            self.x_matrix.fill(0.0);
+            if t > 1 {
+                // > Replace ind(1:t) by the first t indices in ind(1:n) that are not in ind_hist.
+                //
+                // > X(:, j) = e_ind_j, j = 1:t
+                //
+                // > ind_hist = [ind_hist ind(1:t)]
+                //
+                // NOTE: It's not actually needed to operate on the `indices` vector. What's important
+                // is that the history of indices, `indices_history`, gets updated with visited indices,
+                // and that each column of `x_matrix` is assigned that unit vector that is defined by the
+                // respective index.
+                //
+                // If so many indices have already been used that `n_cols - indices_history.len() < t`
+                // (which means that we have less than `t` unused indices remaining), we have to use a few
+                // historical indices when filling up the columns in `x_matrix`. For that, we put the
+                // historical indices after the fresh indices, but otherwise keep the order induced by `h`
+                // above.
+                let fresh_indices = cmp::min(t, n - self.indices_history.len());
+                if fresh_indices == 0 {
+                    break 'optimization_loop;
+                }
+                let mut current_column_fresh = 0;
+                let mut current_column_historical = fresh_indices;
+                let mut index_iterator = self.indices.iter();
+
+                let mut all_first_t_in_history = true;
+                // First, iterate over the first t sorted indices.
+                for i in (&mut index_iterator).take(t) {
+                    if !self.indices_history.contains(i) {
+                        all_first_t_in_history = false;
+                        self.x_matrix[(*i, current_column_fresh)] = 1.0;
+                        current_column_fresh += 1;
+                        self.indices_history.insert(*i);
+                    } else if current_column_historical < t {
+                        self.x_matrix[(*i, current_column_historical)] = 1.0;
+                        current_column_historical += 1;
+                    }
+                }
+
+                // > if ind(1:t) is contained in ind_hist, goto (6), end
+                if all_first_t_in_history {
+                    break 'optimization_loop;
+                }
+
+                // Iterate over the remaining indices
+                'fill_x: for i in index_iterator {
+                    if current_column_fresh >= t {
+                        break 'fill_x;
+                    }
+                    if !self.indices_history.contains(i) {
+                        self.x_matrix[(*i, current_column_fresh)] = 1.0;
+                        current_column_fresh += 1;
+                        self.indices_history.insert(*i);
+                    } else if current_column_historical < t {
+                        self.x_matrix[(*i, current_column_historical)] = 1.0;
+                        current_column_historical += 1;
+                    }
+                }
+            }
+        }
+
+        estimate
     }
 }
 
@@ -85,242 +330,11 @@ impl Normest1 {
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
 pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 {
-    assert!(itmax > 1);
-    let (n_rows, n_cols) = a_matrix.dim();
-    assert_eq!(n_rows, n_cols, "normest1 only works for square matrices");
-
-    let n = n_rows;
+    // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
+    // normest.calculate will fail.
+    let n = a_matrix.dim().1;
     let mut normest1 = Normest1::new(n, t);
-
-    let sample = [-1., 1.0];
-
-    // “We now explain our choice of starting matrix. We take the first column of X to be the
-    // vector of 1s, which is the starting vector used in Algorithm 2.1. This has the advantage
-    // that for a matrix with nonnegative elements the algorithm converges with an exact estimate
-    // on the second iteration, and such matrices arise in applications, for example as a
-    // stochastic matrix or as the inverse of an M -matrix.”
-    //
-    // “The remaining columns are chosen as rand {− 1 , 1 } , with a check for and correction of
-    // parallel columns, exactly as for S in the body of the algorithm. We choose random vectors
-    // because it is difficult to argue for any particular fixed vectors and because randomness
-    // lessens the importance of counterexamples (see the comments in the next section).”
-    {
-        let rng_mut = &mut normest1.rng;
-        normest1.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())]);
-        normest1.x_matrix.column_mut(0).fill(1.);
-    }
-
-    // Resample the x_matrix to make sure no columns are parallel
-    find_parallel_columns_in(&normest1.x_matrix, &mut normest1.y_matrix, &mut normest1.column_is_parallel);
-    for (i, is_parallel) in normest1.column_is_parallel.iter().enumerate() {
-        if *is_parallel {
-            resample_column(&mut normest1.x_matrix, i, &mut normest1.rng, &sample);
-        }
-    }
-
-    // Set all columns to unit vectors
-    normest1.x_matrix.mapv_inplace(|x| x / n as f64);
-
-    let mut estimate = 0.0;
-    let mut best_index = 0;
-
-    'optimization_loop: for k in 0..itmax {
-        // Y = A X
-        {
-            let (a_slice, a_layout) = as_slice_with_layout(&a_matrix).expect("Matrix `a` not contiguous.");
-            let (x_slice, x_layout) = as_slice_with_layout(&normest1.x_matrix).expect("Matrix `x` not contiguous.");
-            let (y_slice, y_layout) = as_slice_with_layout_mut(&mut normest1.y_matrix).expect("Matrix `y` not contiguous.");
-            assert_eq!(a_layout, x_layout);
-            assert_eq!(a_layout, y_layout);
-            let layout = a_layout;
-            unsafe {
-                cblas::dgemm(
-                    layout,
-                    cblas::Transpose::None,
-                    cblas::Transpose::None,
-                    n as i32,
-                    t as i32,
-                    n as i32,
-                    1.0,
-                    a_slice,
-                    n as i32,
-                    x_slice,
-                    t as i32,
-                    0.0,
-                    y_slice,
-                    t as i32,
-                )
-            }
-        }
-
-        // est = max{‖Y(:,j)‖₁ : j = 1:t}
-        let (max_norm_index, max_norm) = matrix_onenorm_with_index(&normest1.y_matrix);
-
-        // if est > est_old or k=2
-        if max_norm > estimate || k == 1 {
-            // ind_best = indⱼ where est = ‖Y(:,j)‖₁, w = Y(:, ind_best)
-            estimate = max_norm;
-            best_index = normest1.indices[max_norm_index];
-            normest1.w_vector.assign(&normest1.y_matrix.column(max_norm_index));
-        } else if k > 1 && max_norm <= estimate {
-            break 'optimization_loop
-        }
-
-        if k >= itmax {
-            break 'optimization_loop
-        }
-
-        // > est_old = est, Sold = S
-        // NOTE: We don't “save” the old estimate, because we are using max_norm as another name
-        // for the new estimate instead of overwriting/reusing est.
-        normest1.sign_matrix_old.assign(&normest1.sign_matrix);
-
-        // S = sign(Y)
-        assign_signum_of_array(
-            &normest1.y_matrix,
-            &mut normest1.sign_matrix
-        );
-
-        // TODO: Combine the test checking for parallelity between _all_ columns between S
-        // and S_old with the “if t > 1” test below.
-        //
-        // > If every column of S is parallel to a column of Sold, goto (6), end
-        //
-        // NOTE: We are reusing `y_matrix` here as a temporary value.
-        if are_all_columns_parallel_between(&normest1.sign_matrix_old, &normest1.sign_matrix, &mut normest1.y_matrix) {
-            break 'optimization_loop;
-        }
-
-        // FIXME: Is an explicit if condition here necessary?
-        if t > 1 {
-            // > Ensure that no column of S is parallel to another column of S
-            // > or to a column of Sold by replacing columns of S by rand{-1,+1}
-            //
-            // NOTE: We are reusing `y_matrix` here as a temporary value.
-            resample_parallel_columns(
-                &mut normest1.sign_matrix,
-                &normest1.sign_matrix_old,
-                &mut normest1.y_matrix,
-                &mut normest1.column_is_parallel,
-                &mut normest1.rng,
-                &sample,
-            );
-        }
-
-        // Z = A^T S
-        let (a_slice, a_layout) = as_slice_with_layout(&a_matrix).expect("Matrix `a` is not contiguous.");
-        let (sign_slice, sign_layout) = as_slice_with_layout(&normest1.sign_matrix).expect("Matrix `sign` is not contiguous.");
-        let (z_slice, z_layout) = as_slice_with_layout_mut(&mut normest1.z_matrix).expect("Matrix `z` is not contiguous.");
-        assert_eq!(a_layout, sign_layout);
-        assert_eq!(a_layout, z_layout);
-        let layout = a_layout;
-        // NOTE: In RowMajor order, f77 dgemm sees all matrices as their transpose. Hence, the
-        // wrapper cblas::dgemm executes C = A B as C^T = B^T A^T. The arguments below have to be
-        // adjusted accordingly.
-        unsafe {
-            cblas::dgemm(
-                layout,
-                cblas::Transpose::Ordinary,
-                cblas::Transpose::None,
-                n as i32, // Number of rows of Op(a)
-                t as i32, // Number of columns of Op(b)
-                n as i32,
-                1.0,
-                a_slice,
-                n as i32,
-                sign_slice,
-                t as i32,
-                0.0,
-                z_slice,
-                t as i32,
-            )
-        }
-
-        // hᵢ= ‖Z(i,:)‖_∞
-        let mut max_h = 0.0;
-        for (row, h_element) in normest1.z_matrix.genrows().into_iter().zip(normest1.h.iter_mut()) {
-            let h = vector_maxnorm(&row);
-            max_h = if h > max_h { h } else { max_h };
-            // Convert f64 to NotNan for using sort_unstable_by below
-            *h_element = h.into();
-        }
-
-        // TODO: This test for equality needs an approximate equality test instead.
-        if k > 0 && max_h == normest1.h[best_index].into() {
-            break 'optimization_loop
-        }
-
-        // > Sort h so that h_1 >= ... >= h_n and re-order correspondingly.
-        // NOTE: h itself doesn't need to be reordered. Only the order of
-        // the indices is relevant.
-        {
-            let h_ref = &normest1.h;
-            normest1.indices.sort_unstable_by(|i, j| h_ref[*j].cmp(&h_ref[*i]));
-        }
-
-        normest1.x_matrix.fill(0.0);
-        if t > 1 {
-            // > Replace ind(1:t) by the first t indices in ind(1:n) that are not in ind_hist.
-            //
-            // > X(:, j) = e_ind_j, j = 1:t
-            //
-            // > ind_hist = [ind_hist ind(1:t)]
-            //
-            // NOTE: It's not actually needed to operate on the `indices` vector. What's important
-            // is that the history of indices, `indices_history`, gets updated with visited indices,
-            // and that each column of `x_matrix` is assigned that unit vector that is defined by the
-            // respective index.
-            //
-            // If so many indices have already been used that `n_cols - indices_history.len() < t`
-            // (which means that we have less than `t` unused indices remaining), we have to use a few
-            // historical indices when filling up the columns in `x_matrix`. For that, we put the
-            // historical indices after the fresh indices, but otherwise keep the order induced by `h`
-            // above.
-            let fresh_indices = cmp::min(t, n - normest1.indices_history.len());
-            if fresh_indices == 0 {
-                break 'optimization_loop;
-            }
-            let mut current_column_fresh = 0;
-            let mut current_column_historical = fresh_indices;
-            let mut index_iterator = normest1.indices.iter();
-
-            let mut all_first_t_in_history = true;
-            // First, iterate over the first t sorted indices.
-            for i in (&mut index_iterator).take(t) {
-                if !normest1.indices_history.contains(i) {
-                    all_first_t_in_history = false;
-                    normest1.x_matrix[(*i, current_column_fresh)] = 1.0;
-                    current_column_fresh += 1;
-                    normest1.indices_history.insert(*i);
-                } else if current_column_historical < t {
-                    normest1.x_matrix[(*i, current_column_historical)] = 1.0;
-                    current_column_historical += 1;
-                }
-            }
-
-            // > if ind(1:t) is contained in ind_hist, goto (6), end
-            if all_first_t_in_history {
-                break 'optimization_loop;
-            }
-
-            // Iterate over the remaining indices
-            'fill_x: for i in index_iterator {
-                if current_column_fresh >= t {
-                    break 'fill_x;
-                }
-                if !normest1.indices_history.contains(i) {
-                    normest1.x_matrix[(*i, current_column_fresh)] = 1.0;
-                    current_column_fresh += 1;
-                    normest1.indices_history.insert(*i);
-                } else if current_column_historical < t {
-                    normest1.x_matrix[(*i, current_column_historical)] = 1.0;
-                    current_column_historical += 1;
-                }
-            }
-        }
-    }
-
-    estimate
+    normest1.calculate(a_matrix, itmax)
 }
 
 /// Assigns the sign of matrix `a` to matrix `b`.
@@ -762,6 +776,20 @@ fn as_slice_with_layout_mut<S, T, D>(a: &mut ArrayBase<S, D>) -> Option<(&mut [T
     // } else {
     //     None
     // }
+}
+
+/// Returns the layout underlying an array `a`.
+fn array_layout<S, T, D>(a: &ArrayBase<S, D>) -> Option<cblas::Layout>
+    where S: Data<Elem = T>,
+          D: Dimension,
+{
+    if a.as_slice().is_some() {
+        Some(cblas::Layout::RowMajor)
+    } else if a.as_slice_memory_order().is_some() {
+        Some(cblas::Layout::ColumnMajor)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
