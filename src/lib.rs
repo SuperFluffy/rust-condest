@@ -16,11 +16,66 @@ use ordered_float::NotNan;
 use rand::{
     Rng,
     SeedableRng,
+    thread_rng,
 };
 use rand_xoshiro::Xoshiro256StarStar;
 use std::collections::BTreeSet;
 use std::cmp;
 use std::slice;
+
+pub struct Normest1 {
+    n: usize,
+    t: usize,
+    rng: Xoshiro256StarStar,
+    x_matrix: Array2<f64>,
+    y_matrix: Array2<f64>,
+    z_matrix: Array2<f64>,
+    w_vector: Array1<f64>,
+    sign_matrix: Array2<f64>,
+    sign_matrix_old: Array2<f64>,
+    column_is_parallel: Vec<bool>,
+    indices: Vec<usize>,
+    indices_history: BTreeSet<usize>,
+    h: Vec<NotNan<f64>>,
+}
+
+impl Normest1 {
+    pub fn new(n: usize, t: usize) -> Self {
+        assert!(t <= n, "Cannot have more iteration columns t than columns in the matrix.");
+        let rng = Xoshiro256StarStar::from_rng(&mut thread_rng()).expect("Rng initialization failed.");
+        let x_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+        let y_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+        let z_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+
+        let w_vector = unsafe { Array1::uninitialized(n) };
+
+        let sign_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+        let sign_matrix_old = unsafe { Array2::<f64>::uninitialized((n, t)) };
+
+        let column_is_parallel = vec![false; t];
+
+        let indices = (0..n).collect();
+        let indices_history = BTreeSet::new();
+
+        let h = vec![unsafe { NotNan::unchecked_new(0.0) }; n];
+
+        Normest1 {
+            n,
+            t,
+            rng,
+            x_matrix,
+            y_matrix,
+            z_matrix,
+            w_vector,
+            sign_matrix,
+            sign_matrix_old,
+            column_is_parallel,
+            indices,
+            indices_history,
+            h,
+        }
+    }
+}
 
 /// Estimates the 1-norm of matrix `a`.
 ///
@@ -32,19 +87,13 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 {
     assert!(itmax > 1);
     let (n_rows, n_cols) = a_matrix.dim();
-    assert_eq!(n_rows, n_cols);
-    assert!(t < n_cols);
+    assert_eq!(n_rows, n_cols, "normest1 only works for square matrices");
 
     let n = n_rows;
+    let mut normest1 = Normest1::new(n, t);
 
-    let mut thread_rng = rand::thread_rng();
-    // TODO: Exchange for xoshiro, once it's merged into rust-rand
-    let mut rng = Xoshiro256StarStar::from_rng(&mut thread_rng).expect("Rng initialization failed.");
     let sample = [-1., 1.0];
 
-    let mut sign_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
-    let mut sign_matrix_old = unsafe { Array2::<f64>::uninitialized((n, t)) };
-    // X
     // “We now explain our choice of starting matrix. We take the first column of X to be the
     // vector of 1s, which is the starting vector used in Algorithm 2.1. This has the advantage
     // that for a matrix with nonnegative elements the algorithm converges with an exact estimate
@@ -55,50 +104,32 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
     // parallel columns, exactly as for S in the body of the algorithm. We choose random vectors
     // because it is difficult to argue for any particular fixed vectors and because randomness
     // lessens the importance of counterexamples (see the comments in the next section).”
-    let mut x_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
-    x_matrix.mapv_inplace(|_| sample[rng.gen_range(0, sample.len())]);
-    x_matrix.column_mut(0).fill(1.);
-
-    // Y
-    // NOTE: The Y matrix is used as a temporary matrix for all sorts of operations, that is for
-    // the operations as specified in the paper, but also for checking the parallelity between
-    // matrix columns.
-    let mut y_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+    {
+        let rng_mut = &mut normest1.rng;
+        normest1.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())]);
+        normest1.x_matrix.column_mut(0).fill(1.);
+    }
 
     // Resample the x_matrix to make sure no columns are parallel
-    let mut column_is_parallel = vec![false; t];
-    find_parallel_columns_in(&x_matrix, &mut y_matrix, &mut column_is_parallel);
-    for (i, is_parallel) in column_is_parallel.iter().enumerate() {
+    find_parallel_columns_in(&normest1.x_matrix, &mut normest1.y_matrix, &mut normest1.column_is_parallel);
+    for (i, is_parallel) in normest1.column_is_parallel.iter().enumerate() {
         if *is_parallel {
-            resample_column(&mut x_matrix, i, &mut rng, &sample);
+            resample_column(&mut normest1.x_matrix, i, &mut normest1.rng, &sample);
         }
     }
 
     // Set all columns to unit vectors
-    x_matrix.mapv_inplace(|x| x / n as f64);
-
-    // Z
-    let mut z_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+    normest1.x_matrix.mapv_inplace(|x| x / n as f64);
 
     let mut estimate = 0.0;
     let mut best_index = 0;
-    let mut w = unsafe { Array1::uninitialized(n) };
-
-    // > hᵢ= ‖Z(i,:)‖_∞
-    //
-    // NOTE: The maximum is taken along the *rows* of Z
-    let mut h = vec![unsafe { NotNan::unchecked_new(0.0) }; n];
-
-    // > indᵢ= i, i:n
-    let mut indices: Vec<usize> = (0..n).collect();
-    let mut indices_history = BTreeSet::new();
 
     'optimization_loop: for k in 0..itmax {
         // Y = A X
         {
             let (a_slice, a_layout) = as_slice_with_layout(&a_matrix).expect("Matrix `a` not contiguous.");
-            let (x_slice, x_layout) = as_slice_with_layout(&x_matrix).expect("Matrix `x` not contiguous.");
-            let (y_slice, y_layout) = as_slice_with_layout_mut(&mut y_matrix).expect("Matrix `y` not contiguous.");
+            let (x_slice, x_layout) = as_slice_with_layout(&normest1.x_matrix).expect("Matrix `x` not contiguous.");
+            let (y_slice, y_layout) = as_slice_with_layout_mut(&mut normest1.y_matrix).expect("Matrix `y` not contiguous.");
             assert_eq!(a_layout, x_layout);
             assert_eq!(a_layout, y_layout);
             let layout = a_layout;
@@ -123,14 +154,14 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
         }
 
         // est = max{‖Y(:,j)‖₁ : j = 1:t}
-        let (max_norm_index, max_norm) = matrix_onenorm_with_index(&y_matrix);
+        let (max_norm_index, max_norm) = matrix_onenorm_with_index(&normest1.y_matrix);
 
         // if est > est_old or k=2
         if max_norm > estimate || k == 1 {
             // ind_best = indⱼ where est = ‖Y(:,j)‖₁, w = Y(:, ind_best)
             estimate = max_norm;
-            best_index = indices[max_norm_index];
-            w.assign(&y_matrix.column(max_norm_index));
+            best_index = normest1.indices[max_norm_index];
+            normest1.w_vector.assign(&normest1.y_matrix.column(max_norm_index));
         } else if k > 1 && max_norm <= estimate {
             break 'optimization_loop
         }
@@ -142,12 +173,12 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
         // > est_old = est, Sold = S
         // NOTE: We don't “save” the old estimate, because we are using max_norm as another name
         // for the new estimate instead of overwriting/reusing est.
-        sign_matrix_old.assign(&sign_matrix);
+        normest1.sign_matrix_old.assign(&normest1.sign_matrix);
 
         // S = sign(Y)
         assign_signum_of_array(
-            &y_matrix,
-            &mut sign_matrix
+            &normest1.y_matrix,
+            &mut normest1.sign_matrix
         );
 
         // TODO: Combine the test checking for parallelity between _all_ columns between S
@@ -156,7 +187,7 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
         // > If every column of S is parallel to a column of Sold, goto (6), end
         //
         // NOTE: We are reusing `y_matrix` here as a temporary value.
-        if are_all_columns_parallel_between(&sign_matrix_old, &sign_matrix, &mut y_matrix) {
+        if are_all_columns_parallel_between(&normest1.sign_matrix_old, &normest1.sign_matrix, &mut normest1.y_matrix) {
             break 'optimization_loop;
         }
 
@@ -167,19 +198,19 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
             //
             // NOTE: We are reusing `y_matrix` here as a temporary value.
             resample_parallel_columns(
-                &mut sign_matrix,
-                &sign_matrix_old,
-                &mut y_matrix,
-                &mut column_is_parallel,
-                &mut rng,
+                &mut normest1.sign_matrix,
+                &normest1.sign_matrix_old,
+                &mut normest1.y_matrix,
+                &mut normest1.column_is_parallel,
+                &mut normest1.rng,
                 &sample,
             );
         }
 
         // Z = A^T S
         let (a_slice, a_layout) = as_slice_with_layout(&a_matrix).expect("Matrix `a` is not contiguous.");
-        let (sign_slice, sign_layout) = as_slice_with_layout(&sign_matrix).expect("Matrix `sign` is not contiguous.");
-        let (z_slice, z_layout) = as_slice_with_layout_mut(&mut z_matrix).expect("Matrix `z` is not contiguous.");
+        let (sign_slice, sign_layout) = as_slice_with_layout(&normest1.sign_matrix).expect("Matrix `sign` is not contiguous.");
+        let (z_slice, z_layout) = as_slice_with_layout_mut(&mut normest1.z_matrix).expect("Matrix `z` is not contiguous.");
         assert_eq!(a_layout, sign_layout);
         assert_eq!(a_layout, z_layout);
         let layout = a_layout;
@@ -207,7 +238,7 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 
         // hᵢ= ‖Z(i,:)‖_∞
         let mut max_h = 0.0;
-        for (row, h_element) in z_matrix.genrows().into_iter().zip(h.iter_mut()) {
+        for (row, h_element) in normest1.z_matrix.genrows().into_iter().zip(normest1.h.iter_mut()) {
             let h = vector_maxnorm(&row);
             max_h = if h > max_h { h } else { max_h };
             // Convert f64 to NotNan for using sort_unstable_by below
@@ -215,16 +246,19 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
         }
 
         // TODO: This test for equality needs an approximate equality test instead.
-        if k > 0 && max_h == h[best_index].into() {
+        if k > 0 && max_h == normest1.h[best_index].into() {
             break 'optimization_loop
         }
 
         // > Sort h so that h_1 >= ... >= h_n and re-order correspondingly.
         // NOTE: h itself doesn't need to be reordered. Only the order of
         // the indices is relevant.
-        indices.sort_unstable_by(|i, j| h[*j].cmp(&h[*i]));
+        {
+            let h_ref = &normest1.h;
+            normest1.indices.sort_unstable_by(|i, j| h_ref[*j].cmp(&h_ref[*i]));
+        }
 
-        x_matrix.fill(0.0);
+        normest1.x_matrix.fill(0.0);
         if t > 1 {
             // > Replace ind(1:t) by the first t indices in ind(1:n) that are not in ind_hist.
             //
@@ -242,24 +276,24 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
             // historical indices when filling up the columns in `x_matrix`. For that, we put the
             // historical indices after the fresh indices, but otherwise keep the order induced by `h`
             // above.
-            let fresh_indices = cmp::min(t, n - indices_history.len());
+            let fresh_indices = cmp::min(t, n - normest1.indices_history.len());
             if fresh_indices == 0 {
                 break 'optimization_loop;
             }
             let mut current_column_fresh = 0;
             let mut current_column_historical = fresh_indices;
-            let mut index_iterator = indices.iter();
+            let mut index_iterator = normest1.indices.iter();
 
             let mut all_first_t_in_history = true;
             // First, iterate over the first t sorted indices.
             for i in (&mut index_iterator).take(t) {
-                if !indices_history.contains(i) {
+                if !normest1.indices_history.contains(i) {
                     all_first_t_in_history = false;
-                    x_matrix[(*i, current_column_fresh)] = 1.0;
+                    normest1.x_matrix[(*i, current_column_fresh)] = 1.0;
                     current_column_fresh += 1;
-                    indices_history.insert(*i);
+                    normest1.indices_history.insert(*i);
                 } else if current_column_historical < t {
-                    x_matrix[(*i, current_column_historical)] = 1.0;
+                    normest1.x_matrix[(*i, current_column_historical)] = 1.0;
                     current_column_historical += 1;
                 }
             }
@@ -274,12 +308,12 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
                 if current_column_fresh >= t {
                     break 'fill_x;
                 }
-                if !indices_history.contains(i) {
-                    x_matrix[(*i, current_column_fresh)] = 1.0;
+                if !normest1.indices_history.contains(i) {
+                    normest1.x_matrix[(*i, current_column_fresh)] = 1.0;
                     current_column_fresh += 1;
-                    indices_history.insert(*i);
+                    normest1.indices_history.insert(*i);
                 } else if current_column_historical < t {
-                    x_matrix[(*i, current_column_historical)] = 1.0;
+                    normest1.x_matrix[(*i, current_column_historical)] = 1.0;
                     current_column_historical += 1;
                 }
             }
