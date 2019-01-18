@@ -39,136 +39,6 @@ pub struct Normest1 {
     h: Vec<NotNan<f64>>,
 }
 
-/// A trait to generalize over 1-norm estimates of a matrix `A`, matrix powers `A^m`,
-/// or matrix products `A1 * A2 * ... * An`.
-///
-/// In the 1-norm estimator, one repeatedly constructs a matrix-matrix product between some n×n
-/// matrix X and some other n×t matrix Y. If one wanted to estimate the 1-norm of a matrix m times
-/// itself, X^m, it might thus be computationally less expensive to repeatedly apply
-/// X * ( * ( X ... ( X * Y ) rather than to calculate Z = X^m = X * X * ... * X and then apply Z *
-/// Y. In the first case, one has several matrix-matrix multiplications with complexity O(m*n*n*t),
-/// while in the latter case one has O(m*n*n*n) (plus one more O(n*n*t)).
-///
-/// So in case of t << n, it is cheaper to repeatedly apply matrix multiplication to the smaller
-/// matrix on the RHS, rather than to construct one definite matrix on the LHS.  Of course, this is
-/// modified by the number of iterations needed when performing the norm estimate, sustained
-/// performance of the matrix multiplication method used, etc.
-///
-/// It is at the designation of the user to check what is more efficient: to pass in one definite
-/// matrix or choose the alternative route described here.
-trait LinearOperator {
-    fn multiply_matrix<S>(&self, b: &mut ArrayBase<S, Ix2>, c: &mut ArrayBase<S, Ix2>, transpose: bool)
-        where S: DataMut<Elem=f64>;
-}
-
-impl<S1> LinearOperator for ArrayBase<S1, Ix2>
-    where S1: Data<Elem=f64>,
-{
-    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
-    {
-        let (n_rows, n_cols) = self.dim();
-        assert_eq!(n_rows, n_cols, "Number of rows and columns does not match: `self` has to be a square matrix");
-        let n = n_rows;
-
-        let (b_n, b_t) = b.dim();
-        let (c_n, c_t) = b.dim();
-
-        assert_eq!(n, b_n, "Number of rows of b not equal to number of rows of `self`.");
-        assert_eq!(n, c_n, "Number of rows of c not equal to number of rows of `self`.");
-
-        assert_eq!(b_t, c_t, "Number of columns of b not equal to number of columns of c.");
-
-        let t = b_t;
-
-        let (a_slice, a_layout) = as_slice_with_layout(self).expect("Matrix `self` not contiguous.");
-        let (b_slice, b_layout) = as_slice_with_layout(b).expect("Matrix `b` not contiguous.");
-        let (c_slice, c_layout) = as_slice_with_layout_mut(c).expect("Matrix `c` not contiguous.");
-
-        assert_eq!(a_layout, b_layout);
-        assert_eq!(a_layout, c_layout);
-
-        let layout = a_layout;
-
-        let a_transpose = if transpose {
-            cblas::Transpose::Ordinary
-        } else {
-            cblas::Transpose::None
-        };
-
-        unsafe {
-            cblas::dgemm(
-                layout,
-                a_transpose,
-                cblas::Transpose::None,
-                n as i32,
-                t as i32,
-                n as i32,
-                1.0,
-                a_slice,
-                n as i32,
-                b_slice,
-                t as i32,
-                0.0,
-                c_slice,
-                t as i32,
-            )
-        }
-    }
-}
-
-impl<S1> LinearOperator for [&ArrayBase<S1, Ix2>]
-    where S1: Data<Elem=f64>
-{
-    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
-    {
-        if self.len() > 0 {
-            let mut reversed;
-            let mut forward;
-
-            // TODO: Investigate, if an enum instead of a trait object might be more performant.
-            // This probably doesn't matter for large matrices, but could have a measurable impact
-            // on small ones.
-            let a_iter: &mut dyn DoubleEndedIterator<Item=_> = if transpose {
-                reversed = self.iter().rev();
-                &mut reversed
-            } else {
-                forward = self.iter();
-                &mut forward
-            };
-            let a = a_iter.next().unwrap(); // Ok because of if condition
-            a.multiply_matrix(b, c, transpose);
-
-            // NOTE: The swap in the loop body makes use of the fact that in all instances where
-            // `multiply_matrix` is used, the values potentially stored in `b` are not required
-            // anymore.
-            for a in a_iter {
-                std::mem::swap(b, c);
-                a.multiply_matrix(b, c, transpose);
-            }
-        }
-    }
-}
-
-impl<S1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
-    where S1: Data<Elem=f64>
-{
-    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase< S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
-    {
-        let a = self.0;
-        let m = self.1;
-        if m > 0 {
-            a.multiply_matrix(b, c, transpose);
-            for _ in 1..m {
-                std::mem::swap(b, c);
-                self.0.multiply_matrix(b, c, transpose);
-            }
-        }
-    }
-}
-
 impl Normest1 {
     pub fn new(n: usize, t: usize) -> Self {
         assert!(t <= n, "Cannot have more iteration columns t than columns in the matrix.");
@@ -210,6 +80,10 @@ impl Normest1 {
         where L: LinearOperator + ?Sized
     {
         assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
+
+        // Explicitly empty the index history; all other quantities will be overwritten at some
+        // point.
+        self.indices_history.clear();
 
         let n = self.n;
         let t = self.t;
@@ -408,17 +282,135 @@ impl Normest1 {
     }
 
     /// Estimate the 1-norm of a marix `a` to the power `m` up to `itmax` iterations.
-    pub fn normest1_pow<S>(&mut self, a: &ArrayBase<S, Ix2>, m: usize, itmax: usize) -> f64
+    pub fn normest1_apow<S>(&mut self, a: &ArrayBase<S, Ix2>, m: usize, itmax: usize) -> f64
         where S: Data<Elem=f64>,
     {
         self.calculate(&(a, m), itmax)
     }
 
     /// Estimate the 1-norm of a product of matrices `a1 a2 ... an` up to `itmax` iterations.
-    pub fn normest1_prod<S>(&mut self, aprod: &[&ArrayBase<S, Ix2>], itmax: usize) -> f64
+    pub fn normest1_aprod<S>(&mut self, aprod: &[&ArrayBase<S, Ix2>], itmax: usize) -> f64
         where S: Data<Elem=f64>,
     {
         self.calculate(aprod, itmax)
+    }
+}
+
+/// A trait to generalize over 1-norm estimates of a matrix `A`, matrix powers `A^m`,
+/// or matrix products `A1 * A2 * ... * An`.
+///
+/// In the 1-norm estimator, one repeatedly constructs a matrix-matrix product between some n×n
+/// matrix X and some other n×t matrix Y. If one wanted to estimate the 1-norm of a matrix m times
+/// itself, X^m, it might thus be computationally less expensive to repeatedly apply
+/// X * ( * ( X ... ( X * Y ) rather than to calculate Z = X^m = X * X * ... * X and then apply Z *
+/// Y. In the first case, one has several matrix-matrix multiplications with complexity O(m*n*n*t),
+/// while in the latter case one has O(m*n*n*n) (plus one more O(n*n*t)).
+///
+/// So in case of t << n, it is cheaper to repeatedly apply matrix multiplication to the smaller
+/// matrix on the RHS, rather than to construct one definite matrix on the LHS.  Of course, this is
+/// modified by the number of iterations needed when performing the norm estimate, sustained
+/// performance of the matrix multiplication method used, etc.
+///
+/// It is at the designation of the user to check what is more efficient: to pass in one definite
+/// matrix or choose the alternative route described here.
+trait LinearOperator {
+    fn multiply_matrix<S>(&self, b: &mut ArrayBase<S, Ix2>, c: &mut ArrayBase<S, Ix2>, transpose: bool)
+        where S: DataMut<Elem=f64>;
+}
+
+impl<S1> LinearOperator for ArrayBase<S1, Ix2>
+    where S1: Data<Elem=f64>,
+{
+    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
+        where S2: DataMut<Elem=f64>
+    {
+        let (n_rows, n_cols) = self.dim();
+        assert_eq!(n_rows, n_cols, "Number of rows and columns does not match: `self` has to be a square matrix");
+        let n = n_rows;
+
+        let (b_n, b_t) = b.dim();
+        let (c_n, c_t) = b.dim();
+
+        assert_eq!(n, b_n, "Number of rows of b not equal to number of rows of `self`.");
+        assert_eq!(n, c_n, "Number of rows of c not equal to number of rows of `self`.");
+
+        assert_eq!(b_t, c_t, "Number of columns of b not equal to number of columns of c.");
+
+        let t = b_t;
+
+        let (a_slice, a_layout) = as_slice_with_layout(self).expect("Matrix `self` not contiguous.");
+        let (b_slice, b_layout) = as_slice_with_layout(b).expect("Matrix `b` not contiguous.");
+        let (c_slice, c_layout) = as_slice_with_layout_mut(c).expect("Matrix `c` not contiguous.");
+
+        assert_eq!(a_layout, b_layout);
+        assert_eq!(a_layout, c_layout);
+
+        let layout = a_layout;
+
+        let a_transpose = if transpose {
+            cblas::Transpose::Ordinary
+        } else {
+            cblas::Transpose::None
+        };
+
+        unsafe {
+            cblas::dgemm(
+                layout,
+                a_transpose,
+                cblas::Transpose::None,
+                n as i32,
+                t as i32,
+                n as i32,
+                1.0,
+                a_slice,
+                n as i32,
+                b_slice,
+                t as i32,
+                0.0,
+                c_slice,
+                t as i32,
+            )
+        }
+    }
+}
+
+impl<S1> LinearOperator for [&ArrayBase<S1, Ix2>]
+    where S1: Data<Elem=f64>
+{
+    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
+        where S2: DataMut<Elem=f64>
+    {
+        if self.len() > 0 {
+            let mut a_iter = self.iter();
+            if transpose {
+                a_iter = a_iter.rev();
+            }
+            let a = a_iter.next().unwrap(); // Ok because of if condition
+            a.multiply_matrix(b, c, transpose);
+            // This makes use of the fact that in all instances 
+            for a in self {
+                std::mem::swap(b, c);
+                a.multiply_matrix(b, c, transpose);
+            }
+        }
+    }
+}
+
+impl<S1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
+    where S1: Data<Elem=f64>
+{
+    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase< S2, Ix2>, transpose: bool)
+        where S2: DataMut<Elem=f64>
+    {
+        let a = self.0;
+        let m = self.1;
+        if m > 0 {
+            a.multiply_matrix(b, c, transpose);
+            for _ in 1..m {
+                std::mem::swap(b, c);
+                self.0.multiply_matrix(b, c, transpose);
+            }
+        }
     }
 }
 
@@ -427,54 +419,14 @@ impl Normest1 {
 /// The parameter `t` is the number of vectors that have to fulfill some bound. See [Higham,
 /// Tisseur] for more information. `itmax` is the maximum number of sweeps permitted.
 ///
-/// **NOTE:** This function allocates on every call. If you want to repeatedly estimate the
-/// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
-///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-/// [`Normest1`]: struct.Normest1.html
 pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
     let n = a_matrix.dim().1;
     let mut normest1 = Normest1::new(n, t);
-    normest1.normest1(a_matrix, itmax)
-}
-
-/// Estimates the 1-norm of a matrix `a` to the power `m`, `a^m`.
-///
-/// The parameter `t` is the number of vectors that have to fulfill some bound. See [Higham,
-/// Tisseur] for more information. `itmax` is the maximum number of sweeps permitted.
-///
-/// **NOTE:** This function allocates on every call. If you want to repeatedly estimate the
-/// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
-///
-/// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) -> f64
-{
-    // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
-    // normest.calculate will fail.
-    let n = a_matrix.dim().1;
-    let mut normest1 = Normest1::new(n, t);
-    normest1.normest1_pow(a_matrix, m, itmax)
-}
-
-/// Estimates the 1-norm of a product of matrices `a1`, `a2`, ..., `an` passed in as a slice of
-/// references.
-///
-/// The parameter `t` is the number of vectors that have to fulfill some bound. See [Higham,
-/// Tisseur] for more information. `itmax` is the maximum number of sweeps permitted.
-///
-/// **NOTE:** This function allocates on every call. If you want to repeatedly estimate the
-/// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
-///
-/// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64
-{
-    assert!(a_matrices.len() > 0);
-    let n = a_matrices[0].dim().1;
-    let mut normest1 = Normest1::new(n, t);
-    normest1.normest1_prod(a_matrices, itmax)
+    normest1.calculate(a_matrix, itmax)
 }
 
 /// Assigns the sign of matrix `a` to matrix `b`.
@@ -983,9 +935,6 @@ mod tests {
     /// within 4 ULPS of the calculated/expected one.
     ///
     /// One can probably explain this with different ordering of summation/addition/multiplication.
-    ///
-    /// During tests run performed by the author(s) of this library, running the tets below with
-    /// `nsamples = 5000` happened to always let the test pass.
     fn table_3_t_2() {
         let t = 2;
         let n = 100;
