@@ -37,7 +37,136 @@ pub struct Normest1 {
     indices: Vec<usize>,
     indices_history: BTreeSet<usize>,
     h: Vec<NotNan<f64>>,
-    layout: cblas::Layout,
+}
+
+/// A trait to generalize over 1-norm estimates of a matrix `A`, matrix powers `A^m`,
+/// or matrix products `A1 * A2 * ... * An`.
+///
+/// In the 1-norm estimator, one repeatedly constructs a matrix-matrix product between some n×n
+/// matrix X and some other n×t matrix Y. If one wanted to estimate the 1-norm of a matrix m times
+/// itself, X^m, it might thus be computationally less expensive to repeatedly apply
+/// X * ( * ( X ... ( X * Y ) rather than to calculate Z = X^m = X * X * ... * X and then apply Z *
+/// Y. In the first case, one has several matrix-matrix multiplications with complexity O(m*n*n*t),
+/// while in the latter case one has O(m*n*n*n) (plus one more O(n*n*t)).
+///
+/// So in case of t << n, it is cheaper to repeatedly apply matrix multiplication to the smaller
+/// matrix on the RHS, rather than to construct one definite matrix on the LHS.  Of course, this is
+/// modified by the number of iterations needed when performing the norm estimate, sustained
+/// performance of the matrix multiplication method used, etc.
+///
+/// It is at the designation of the user to check what is more efficient: to pass in one definite
+/// matrix or choose the alternative route described here.
+trait LinearOperator {
+    fn multiply_matrix<S>(&self, b: &mut ArrayBase<S, Ix2>, c: &mut ArrayBase<S, Ix2>, transpose: bool)
+        where S: DataMut<Elem=f64>;
+}
+
+impl<S1> LinearOperator for ArrayBase<S1, Ix2>
+    where S1: Data<Elem=f64>,
+{
+    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
+        where S2: DataMut<Elem=f64>
+    {
+        let (n_rows, n_cols) = self.dim();
+        assert_eq!(n_rows, n_cols, "Number of rows and columns does not match: `self` has to be a square matrix");
+        let n = n_rows;
+
+        let (b_n, b_t) = b.dim();
+        let (c_n, c_t) = b.dim();
+
+        assert_eq!(n, b_n, "Number of rows of b not equal to number of rows of `self`.");
+        assert_eq!(n, c_n, "Number of rows of c not equal to number of rows of `self`.");
+
+        assert_eq!(b_t, c_t, "Number of columns of b not equal to number of columns of c.");
+
+        let t = b_t;
+
+        let (a_slice, a_layout) = as_slice_with_layout(self).expect("Matrix `self` not contiguous.");
+        let (b_slice, b_layout) = as_slice_with_layout(b).expect("Matrix `b` not contiguous.");
+        let (c_slice, c_layout) = as_slice_with_layout_mut(c).expect("Matrix `c` not contiguous.");
+
+        assert_eq!(a_layout, b_layout);
+        assert_eq!(a_layout, c_layout);
+
+        let layout = a_layout;
+
+        let a_transpose = if transpose {
+            cblas::Transpose::Ordinary
+        } else {
+            cblas::Transpose::None
+        };
+
+        unsafe {
+            cblas::dgemm(
+                layout,
+                a_transpose,
+                cblas::Transpose::None,
+                n as i32,
+                t as i32,
+                n as i32,
+                1.0,
+                a_slice,
+                n as i32,
+                b_slice,
+                t as i32,
+                0.0,
+                c_slice,
+                t as i32,
+            )
+        }
+    }
+}
+
+impl<S1> LinearOperator for [&ArrayBase<S1, Ix2>]
+    where S1: Data<Elem=f64>
+{
+    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
+        where S2: DataMut<Elem=f64>
+    {
+        if self.len() > 0 {
+            let mut reversed;
+            let mut forward;
+
+            // TODO: Investigate, if an enum instead of a trait object might be more performant.
+            // This probably doesn't matter for large matrices, but could have a measurable impact
+            // on small ones.
+            let a_iter: &mut dyn DoubleEndedIterator<Item=_> = if transpose {
+                reversed = self.iter().rev();
+                &mut reversed
+            } else {
+                forward = self.iter();
+                &mut forward
+            };
+            let a = a_iter.next().unwrap(); // Ok because of if condition
+            a.multiply_matrix(b, c, transpose);
+
+            // NOTE: The swap in the loop body makes use of the fact that in all instances where
+            // `multiply_matrix` is used, the values potentially stored in `b` are not required
+            // anymore.
+            for a in a_iter {
+                std::mem::swap(b, c);
+                a.multiply_matrix(b, c, transpose);
+            }
+        }
+    }
+}
+
+impl<S1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
+    where S1: Data<Elem=f64>
+{
+    fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase< S2, Ix2>, transpose: bool)
+        where S2: DataMut<Elem=f64>
+    {
+        let a = self.0;
+        let m = self.1;
+        if m > 0 {
+            a.multiply_matrix(b, c, transpose);
+            for _ in 1..m {
+                std::mem::swap(b, c);
+                self.0.multiply_matrix(b, c, transpose);
+            }
+        }
+    }
 }
 
 impl Normest1 {
@@ -60,8 +189,6 @@ impl Normest1 {
 
         let h = vec![unsafe { NotNan::unchecked_new(0.0) }; n];
 
-        let layout = cblas::Layout::RowMajor;
-
         Normest1 {
             n,
             t,
@@ -76,22 +203,13 @@ impl Normest1 {
             indices,
             indices_history,
             h,
-            layout,
         }
     }
 
-    pub fn calculate<S>(&mut self, a_matrix: &ArrayBase<S, Ix2>, itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    fn calculate<L>(&mut self, a_linear_operator: &L, itmax: usize) -> f64
+        where L: LinearOperator + ?Sized
     {
-        if let Some(layout) = array_layout(&a_matrix) {
-            assert_eq!(layout, self.layout, "normest1 is currently only defined for row major matrices");
-        } else {
-            panic!("normest1 is currently only defined for contiguous, row-major matrices");
-        }
         assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
-        let (n_rows, n_cols) = a_matrix.dim();
-        assert_eq!(n_rows, n_cols, "normest1 is only defined for for square matrices");
-        assert_eq!(n_rows, self.n);
 
         let n = self.n;
         let t = self.t;
@@ -129,30 +247,9 @@ impl Normest1 {
         let mut best_index = 0;
 
         'optimization_loop: for k in 0..itmax {
+
             // Y = A X
-            {
-                let (a_slice, _) = as_slice_with_layout(&a_matrix).expect("Matrix `a` not contiguous.");
-                let (x_slice, _) = as_slice_with_layout(&self.x_matrix).expect("Matrix `x` not contiguous.");
-                let (y_slice, _) = as_slice_with_layout_mut(&mut self.y_matrix).expect("Matrix `y` not contiguous.");
-                unsafe {
-                    cblas::dgemm(
-                        self.layout,
-                        cblas::Transpose::None,
-                        cblas::Transpose::None,
-                        n as i32,
-                        t as i32,
-                        n as i32,
-                        1.0,
-                        a_slice,
-                        n as i32,
-                        x_slice,
-                        t as i32,
-                        0.0,
-                        y_slice,
-                        t as i32,
-                    )
-                }
-            }
+            a_linear_operator.multiply_matrix(&mut self.x_matrix, &mut self.y_matrix, false);
 
             // est = max{‖Y(:,j)‖₁ : j = 1:t}
             let (max_norm_index, max_norm) = matrix_onenorm_with_index(&self.y_matrix);
@@ -170,11 +267,6 @@ impl Normest1 {
             if k >= itmax {
                 break 'optimization_loop
             }
-
-            // > est_old = est, Sold = S
-            // NOTE: We don't “save” the old estimate, because we are using max_norm as another name
-            // for the new estimate instead of overwriting/reusing est.
-            self.sign_matrix_old.assign(&self.sign_matrix);
 
             // S = sign(Y)
             assign_signum_of_array(
@@ -208,31 +300,18 @@ impl Normest1 {
                 );
             }
 
+            // > est_old = est, Sold = S
+            // NOTE: Other than in the original algorithm, we store the sign matrix at this point
+            // already. This way, we can reuse the sign matrix as additional workspace which is
+            // useful when performing matrix multiplication with A^m or A1 A2 ... An (see the
+            // description of the LinearOperator trait for explanation).
+            //
+            // NOTE: We don't “save” the old estimate, because we are using max_norm as another name
+            // for the new estimate instead of overwriting/reusing est.
+            self.sign_matrix_old.assign(&self.sign_matrix);
+
             // Z = A^T S
-            let (a_slice, _) = as_slice_with_layout(&a_matrix).expect("Matrix `a` is not contiguous.");
-            let (sign_slice, _) = as_slice_with_layout(&self.sign_matrix).expect("Matrix `sign` is not contiguous.");
-            let (z_slice, _) = as_slice_with_layout_mut(&mut self.z_matrix).expect("Matrix `z` is not contiguous.");
-            // NOTE: In RowMajor order, f77 dgemm sees all matrices as their transpose. Hence, the
-            // wrapper cblas::dgemm executes C = A B as C^T = B^T A^T. The arguments below have to be
-            // adjusted accordingly.
-            unsafe {
-                cblas::dgemm(
-                    self.layout,
-                    cblas::Transpose::Ordinary,
-                    cblas::Transpose::None,
-                    n as i32, // Number of rows of Op(a)
-                    t as i32, // Number of columns of Op(b)
-                    n as i32,
-                    1.0,
-                    a_slice,
-                    n as i32,
-                    sign_slice,
-                    t as i32,
-                    0.0,
-                    z_slice,
-                    t as i32,
-                )
-            }
+            a_linear_operator.multiply_matrix(&mut self.sign_matrix, &mut self.z_matrix, true);
 
             // hᵢ= ‖Z(i,:)‖_∞
             let mut max_h = 0.0;
@@ -320,6 +399,27 @@ impl Normest1 {
 
         estimate
     }
+
+    /// Estimate the 1-norm of matrix `a` using up to `itmax` iterations.
+    pub fn normest1<S>(&mut self, a: &ArrayBase<S, Ix2>, itmax: usize) -> f64
+        where S: Data<Elem=f64>,
+    {
+        self.calculate(a, itmax)
+    }
+
+    /// Estimate the 1-norm of a marix `a` to the power `m` up to `itmax` iterations.
+    pub fn normest1_pow<S>(&mut self, a: &ArrayBase<S, Ix2>, m: usize, itmax: usize) -> f64
+        where S: Data<Elem=f64>,
+    {
+        self.calculate(&(a, m), itmax)
+    }
+
+    /// Estimate the 1-norm of a product of matrices `a1 a2 ... an` up to `itmax` iterations.
+    pub fn normest1_prod<S>(&mut self, aprod: &[&ArrayBase<S, Ix2>], itmax: usize) -> f64
+        where S: Data<Elem=f64>,
+    {
+        self.calculate(aprod, itmax)
+    }
 }
 
 /// Estimates the 1-norm of matrix `a`.
@@ -327,14 +427,54 @@ impl Normest1 {
 /// The parameter `t` is the number of vectors that have to fulfill some bound. See [Higham,
 /// Tisseur] for more information. `itmax` is the maximum number of sweeps permitted.
 ///
+/// **NOTE:** This function allocates on every call. If you want to repeatedly estimate the
+/// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
+///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
+/// [`Normest1`]: struct.Normest1.html
 pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
     let n = a_matrix.dim().1;
     let mut normest1 = Normest1::new(n, t);
-    normest1.calculate(a_matrix, itmax)
+    normest1.normest1(a_matrix, itmax)
+}
+
+/// Estimates the 1-norm of a matrix `a` to the power `m`, `a^m`.
+///
+/// The parameter `t` is the number of vectors that have to fulfill some bound. See [Higham,
+/// Tisseur] for more information. `itmax` is the maximum number of sweeps permitted.
+///
+/// **NOTE:** This function allocates on every call. If you want to repeatedly estimate the
+/// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
+///
+/// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
+pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) -> f64
+{
+    // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
+    // normest.calculate will fail.
+    let n = a_matrix.dim().1;
+    let mut normest1 = Normest1::new(n, t);
+    normest1.normest1_pow(a_matrix, m, itmax)
+}
+
+/// Estimates the 1-norm of a product of matrices `a1`, `a2`, ..., `an` passed in as a slice of
+/// references.
+///
+/// The parameter `t` is the number of vectors that have to fulfill some bound. See [Higham,
+/// Tisseur] for more information. `itmax` is the maximum number of sweeps permitted.
+///
+/// **NOTE:** This function allocates on every call. If you want to repeatedly estimate the
+/// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
+///
+/// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
+pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64
+{
+    assert!(a_matrices.len() > 0);
+    let n = a_matrices[0].dim().1;
+    let mut normest1 = Normest1::new(n, t);
+    normest1.normest1_prod(a_matrices, itmax)
 }
 
 /// Assigns the sign of matrix `a` to matrix `b`.
@@ -778,20 +918,6 @@ fn as_slice_with_layout_mut<S, T, D>(a: &mut ArrayBase<S, D>) -> Option<(&mut [T
     // }
 }
 
-/// Returns the layout underlying an array `a`.
-fn array_layout<S, T, D>(a: &ArrayBase<S, D>) -> Option<cblas::Layout>
-    where S: Data<Elem = T>,
-          D: Dimension,
-{
-    if a.as_slice().is_some() {
-        Some(cblas::Layout::RowMajor)
-    } else if a.as_slice_memory_order().is_some() {
-        Some(cblas::Layout::ColumnMajor)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     extern crate openblas_src;
@@ -808,6 +934,46 @@ mod tests {
     use rand_xoshiro::Xoshiro256Plus;
 
     #[test]
+    fn equality_between_methods() {
+        let t = 2;
+        let n = 100;
+        let itmax = 5;
+
+        let mut rng = Xoshiro256Plus::seed_from_u64(1234);
+        let distribution = StandardNormal;
+
+        let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
+        a_matrix.mapv_inplace(|x| 1.0/x);
+
+        let unity = Array::eye(n);
+
+        let estimate_onlymatrix = crate::normest1(&a_matrix, t, itmax);
+        let estimate_matrixpow = crate::normest1_pow(&a_matrix, 1, t, itmax);
+        let estimate_matrixprod = crate::normest1_prod(&[&a_matrix, &unity], t, itmax);
+
+        assert_eq!(estimate_onlymatrix, estimate_matrixpow);
+        assert_eq!(estimate_onlymatrix, estimate_matrixprod);
+    }
+
+    #[test]
+    fn pow_2_is_prod_2() {
+        let t = 2;
+        let n = 100;
+        let itmax = 5;
+
+        let mut rng = Xoshiro256Plus::seed_from_u64(1234);
+        let distribution = StandardNormal;
+
+        let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
+        a_matrix.mapv_inplace(|x| 1.0/x);
+
+        let estimate_matrixpow = crate::normest1_pow(&a_matrix, 2, t, itmax);
+        let estimate_matrixprod = crate::normest1_prod(&[&a_matrix, &a_matrix], t, itmax);
+
+        assert_eq!(estimate_matrixpow, estimate_matrixprod);
+    }
+
+    #[test]
     /// This performs tests inspired by Table 3 of [Higham and Tisseur].
     ///
     /// NOTE: Due to (most likely) floating point precision), the ratio `calculated/expected` (that
@@ -817,6 +983,9 @@ mod tests {
     /// within 4 ULPS of the calculated/expected one.
     ///
     /// One can probably explain this with different ordering of summation/addition/multiplication.
+    ///
+    /// During tests run performed by the author(s) of this library, running the tets below with
+    /// `nsamples = 5000` happened to always let the test pass.
     fn table_3_t_2() {
         let t = 2;
         let n = 100;
