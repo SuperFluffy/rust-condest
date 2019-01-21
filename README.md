@@ -1,32 +1,30 @@
-# Condition number estimation in Rust
+# Condition number and 1-norm estimation in Rust
 
-This crate implements the matrix 1-norm estimator by [Higham and Tisseur]
-(Algorithm 2.4 on page 7 (1190)) in the linked PDF.
+This crate implements the matrix 1-norm estimator by [Higham and Tisseur],
+Algorithm 2.4 on page 7 (1190) in the linked document. It allows for 1-norm estimation
+of a single matrices, `A`, matrix powers, `A^m`, and matrix products, `A1 * A2 * ... * An`,
+which can be cheaper than explicitly calculating them.
 
 It uses the excellent [`rust-ndarray`] crate for matrix storage.
 
 [Higham and Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
 [`rust-ndarray`]: https://github.com/rust-ndarray/ndarray
 
-## Todo
-
-Right now, this crate only returns the 1-norm, and further allocates anew on every call
-to `normest1`. It does not currently yield the vectors necessary to calculate the actual
-condition number. This isn't hard to do, but needs to be implemented... Outstanding are:
-
-+ [ ] Return vectors required for calculating the 1-norm;
-+ [x] Create a struct holding the necessary temporaries to repeatedly call `normest1` without extra allocation.
-+ [ ] Implement extra tests to mimic the numerical experiments in [Higham and Tisseur].
-+ [ ] Make some nice docs.
-
 ## Example usage
 
-The example below generates a random matrix `a` and estimates its 1-norm. On average, this gives
-pretty good results. Of course, there are some matrices where this algorithm severely underestimates
-the actual 1-norm. See [Higham and Tisseur] for more.
+The example below generates a random matrix `a` and estimates its 1-norm. On
+average, this gives pretty good results. Of course, there are some matrices
+where this algorithm severely underestimates the actual 1-norm. See [Higham and
+Tisseur] for more.
 
-**Important:** You need to explicitly link to a BLAS + LAPACK provider such as `openblas_src`.
-See the explanations given at the [`blas-lapack-rs` organization].
+`condest::normest1` creates a `Normest1` struct, uses it to estimate the
+1-norm, and throws it away. If you want to repeatedly estimate 1-norms of
+matrices of the same dimensions, initialize `Normest1` and call `normest1`,
+`normest1_pow` or `normest1_prod` on it.
+
+
+**Important:** You need to explicitly link to a BLAS + LAPACK provider such as
+`openblas_src`. See the explanations given at the [`blas-lapack-rs` organization].
 
 [`blas-lapack-rs` organization]: https://github.com/blas-lapack-rs/blas-lapack-rs.github.io/wiki
 
@@ -79,3 +77,15 @@ fn main() {
     assert_eq!(estimated, expected);
 }
 ```
+
+## Todo
+
+Right now, only 1-norm estimates are exposed. The vectors needed to estimate
+the condition number are implemented, but are not yet accessible through an API.
+Outstanding points are:
+
++ [ ] Return vectors required for calculating the 1-norm;
++ [x] Create a struct holding the necessary temporaries to repeatedly call `normest1` without extra allocation.
++ [ ] Implement extra tests to mimic the numerical experiments in [Higham and Tisseur].
++ [ ] Make some nice docs.
+
