@@ -211,6 +211,10 @@ impl Normest1 {
     {
         assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
 
+        // Explicitly empty the index history; all other quantities will be overwritten at some
+        // point.
+        self.indices_history.clear();
+
         let n = self.n;
         let t = self.t;
 
