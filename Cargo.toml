@@ -1,10 +1,10 @@
 [package]
 name = "condest"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Richard Janis Goldschmidt <janis.beckert@gmail.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/superluffy/rust-condest"
+repository = "https://github.com/superfluffy/rust-condest"
 description = "An implementation of the 1-norm and condition number estimator by Higham and Tisseur, 2000"
 readme = "README.md"
 
