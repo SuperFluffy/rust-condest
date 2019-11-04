@@ -648,7 +648,8 @@ fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
         };
         T::syrk(layout,
                 cblas::Part::Upper,
-                cblas::Transpose::Conjugate,
+            //All entries are assumed to be real, so herk w/ conj trans is not necessary
+                cblas::Transpose::Ordinary,
                 n_cols as i32,
                 k as i32,
                 T::from_subset(&1.0),
@@ -657,21 +658,6 @@ fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
                 T::zero(),
                 c_slice,
                 n_cols as i32,);
-//        unsafe {
-//            cblas::dsyrk(
-//                layout,
-//                cblas::Part::Upper,
-//                cblas::Transpose::Ordinary,
-//                n_cols as i32,
-//                k as i32,
-//                1.0,
-//                a_slice,
-//                lda as i32,
-//                0.0,
-//                c_slice,
-//                n_cols as i32,
-//            );
-//       }
     }
 
     // c is upper triangular and contains all pair-wise vector products:
