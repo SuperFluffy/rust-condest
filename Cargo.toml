@@ -12,13 +12,19 @@ categories = ["science"]
 keywords = ["condition", "linalg", "matrix", "ndarray", "norm"]
 
 [dependencies]
+alga = "0.9.2"
 cblas = "0.2"
 lapacke = "0.2"
 ndarray = "0.12"
+num-traits = "0.2.8"
 ordered-float = "1.0"
 rand = "0.6"
 rand_xoshiro = "0.1"
 
+blas-traits = {git="https://github.com/hmunozb/blas-traits"}
+
 [dev-dependencies]
 ndarray-rand = "0.9"
 openblas-src = "0.7"
+lapacke-sys = "0.1.4"
+

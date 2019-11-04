@@ -1,7 +1,8 @@
 //! This crate implements the matrix 1-norm estimator by [Higham and Tisseur].
 //!
 //! [Higham and Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-
+use alga::general::{ComplexField, SupersetOf};
+use blas_traits::BlasScalar;
 use ndarray::{
     prelude::*,
     ArrayBase,
@@ -12,6 +13,7 @@ use ndarray::{
     Ix2,
     s,
 };
+use num_traits::{Float, Zero};
 use ordered_float::NotNan;
 use rand::{
     Rng,
@@ -22,17 +24,18 @@ use rand_xoshiro::Xoshiro256StarStar;
 use std::collections::BTreeSet;
 use std::cmp;
 use std::slice;
+use std::any::TypeId;
 
-pub struct Normest1 {
+pub struct Normest1<T: BlasScalar> where {
     n: usize,
     t: usize,
     rng: Xoshiro256StarStar,
-    x_matrix: Array2<f64>,
-    y_matrix: Array2<f64>,
-    z_matrix: Array2<f64>,
-    w_vector: Array1<f64>,
-    sign_matrix: Array2<f64>,
-    sign_matrix_old: Array2<f64>,
+    x_matrix: Array2<T>,
+    y_matrix: Array2<T>,
+    z_matrix: Array2<T>,
+    w_vector: Array1<T>,
+    sign_matrix: Array2<T>,
+    sign_matrix_old: Array2<T>,
     column_is_parallel: Vec<bool>,
     indices: Vec<usize>,
     indices_history: BTreeSet<usize>,
@@ -56,16 +59,16 @@ pub struct Normest1 {
 ///
 /// It is at the designation of the user to check what is more efficient: to pass in one definite
 /// matrix or choose the alternative route described here.
-trait LinearOperator {
+trait LinearOperator<T: BlasScalar> {
     fn multiply_matrix<S>(&self, b: &mut ArrayBase<S, Ix2>, c: &mut ArrayBase<S, Ix2>, transpose: bool)
-        where S: DataMut<Elem=f64>;
+        where S: DataMut<Elem=T>;
 }
 
-impl<S1> LinearOperator for ArrayBase<S1, Ix2>
-    where S1: Data<Elem=f64>,
+impl<S1, T: BlasScalar> LinearOperator<T> for ArrayBase<S1, Ix2>
+    where S1: Data<Elem=T>,
 {
     fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
+        where S2: DataMut<Elem=T>
     {
         let (n_rows, n_cols) = self.dim();
         assert_eq!(n_rows, n_cols, "Number of rows and columns does not match: `self` has to be a square matrix");
@@ -91,37 +94,22 @@ impl<S1> LinearOperator for ArrayBase<S1, Ix2>
         let layout = a_layout;
 
         let a_transpose = if transpose {
-            cblas::Transpose::Ordinary
+            cblas::Transpose::Conjugate     // Simple transpose in real case
         } else {
             cblas::Transpose::None
         };
-
-        unsafe {
-            cblas::dgemm(
-                layout,
-                a_transpose,
-                cblas::Transpose::None,
-                n as i32,
-                t as i32,
-                n as i32,
-                1.0,
-                a_slice,
-                n as i32,
-                b_slice,
-                t as i32,
-                0.0,
-                c_slice,
-                t as i32,
-            )
-        }
+        T::gemm(layout, a_transpose, cblas::Transpose::None,
+                 n as i32, t as i32, n as i32,
+                 T::from_subset(&1.0), a_slice, n as i32, b_slice, t as i32,
+                 T::from_subset(&0.0), c_slice, t as i32,);
     }
 }
 
-impl<S1> LinearOperator for [&ArrayBase<S1, Ix2>]
-    where S1: Data<Elem=f64>
+impl<S1, T: BlasScalar> LinearOperator<T> for [&ArrayBase<S1, Ix2>]
+    where S1: Data<Elem=T>
 {
     fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
+        where S2: DataMut<Elem=T>
     {
         if self.len() > 0 {
             let mut reversed;
@@ -151,11 +139,11 @@ impl<S1> LinearOperator for [&ArrayBase<S1, Ix2>]
     }
 }
 
-impl<S1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
-    where S1: Data<Elem=f64>
+impl<S1, T: BlasScalar> LinearOperator<T> for (&ArrayBase<S1, Ix2>, usize)
+    where S1: Data<Elem=T>
 {
     fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase< S2, Ix2>, transpose: bool)
-        where S2: DataMut<Elem=f64>
+        where S2: DataMut<Elem=T>
     {
         let a = self.0;
         let m = self.1;
@@ -169,18 +157,18 @@ impl<S1> LinearOperator for (&ArrayBase<S1, Ix2>, usize)
     }
 }
 
-impl Normest1 {
+impl<T: BlasScalar> Normest1<T> {
     pub fn new(n: usize, t: usize) -> Self {
         assert!(t <= n, "Cannot have more iteration columns t than columns in the matrix.");
         let rng = Xoshiro256StarStar::from_rng(&mut thread_rng()).expect("Rng initialization failed.");
-        let x_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
-        let y_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
-        let z_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
+        let x_matrix = unsafe { Array2::uninitialized((n, t)) };
+        let y_matrix = unsafe { Array2::uninitialized((n, t)) };
+        let z_matrix = unsafe { Array2::uninitialized((n, t)) };
 
         let w_vector = unsafe { Array1::uninitialized(n) };
 
-        let sign_matrix = unsafe { Array2::<f64>::uninitialized((n, t)) };
-        let sign_matrix_old = unsafe { Array2::<f64>::uninitialized((n, t)) };
+        let sign_matrix = unsafe { Array2::uninitialized((n, t)) };
+        let sign_matrix_old = unsafe { Array2::uninitialized((n, t)) };
 
         let column_is_parallel = vec![false; t];
 
@@ -206,8 +194,8 @@ impl Normest1 {
         }
     }
 
-    fn calculate<L>(&mut self, a_linear_operator: &L, itmax: usize) -> f64
-        where L: LinearOperator + ?Sized
+    fn calculate<L>(&mut self, a_linear_operator: &L, itmax: usize) -> T::RealField
+        where L: LinearOperator<T> + ?Sized
     {
         assert!(itmax > 1, "normest1 is undefined for iterations itmax < 2");
 
@@ -218,7 +206,7 @@ impl Normest1 {
         let n = self.n;
         let t = self.t;
 
-        let sample = [-1., 1.0];
+        let sample = [-T::one(), T::one()];
 
         // “We now explain our choice of starting matrix. We take the first column of X to be the
         // vector of 1s, which is the starting vector used in Algorithm 2.1. This has the advantage
@@ -232,8 +220,8 @@ impl Normest1 {
         // lessens the importance of counterexamples (see the comments in the next section).”
         {
             let rng_mut = &mut self.rng;
-            self.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())]);
-            self.x_matrix.column_mut(0).fill(1.);
+            self.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())] );
+            self.x_matrix.column_mut(0).fill(T::one());
         }
 
         // Resample the x_matrix to make sure no columns are parallel
@@ -245,9 +233,9 @@ impl Normest1 {
         }
 
         // Set all columns to unit vectors
-        self.x_matrix.mapv_inplace(|x| x / n as f64);
+        self.x_matrix.mapv_inplace(|x| (x / T::from_usize(n).unwrap()) );
 
-        let mut estimate = 0.0;
+        let mut estimate = T::RealField::zero();
         let mut best_index = 0;
 
         'optimization_loop: for k in 0..itmax {
@@ -294,14 +282,17 @@ impl Normest1 {
                 // > or to a column of Sold by replacing columns of S by rand{-1,+1}
                 //
                 // NOTE: We are reusing `y_matrix` here as a temporary value.
-                resample_parallel_columns(
-                    &mut self.sign_matrix,
-                    &self.sign_matrix_old,
-                    &mut self.y_matrix,
-                    &mut self.column_is_parallel,
-                    &mut self.rng,
-                    &sample,
-                );
+                // Note: Parallel column test can be skipped in complex case
+                if TypeId::of::<T>() == TypeId::of::<f32>() || TypeId::of::<T>() == TypeId::of::<f64>(){
+                    resample_parallel_columns(
+                        &mut self.sign_matrix,
+                        &self.sign_matrix_old,
+                        &mut self.y_matrix,
+                        &mut self.column_is_parallel,
+                        &mut self.rng,
+                        &sample,
+                    );
+                }
             }
 
             // > est_old = est, Sold = S
@@ -315,19 +306,20 @@ impl Normest1 {
             self.sign_matrix_old.assign(&self.sign_matrix);
 
             // Z = A^T S
+            //
             a_linear_operator.multiply_matrix(&mut self.sign_matrix, &mut self.z_matrix, true);
 
             // hᵢ= ‖Z(i,:)‖_∞
-            let mut max_h = 0.0;
+            let mut max_h = T::RealField::zero();
             for (row, h_element) in self.z_matrix.genrows().into_iter().zip(self.h.iter_mut()) {
-                let h = vector_maxnorm(&row);
+                let h : T::RealField = vector_maxnorm(&row);
                 max_h = if h > max_h { h } else { max_h };
                 // Convert f64 to NotNan for using sort_unstable_by below
-                *h_element = h.into();
+                *h_element = h.to_subset().unwrap().into();
             }
 
             // TODO: This test for equality needs an approximate equality test instead.
-            if k > 0 && max_h == self.h[best_index].into() {
+            if k > 0 && max_h == T::RealField::from_subset(&self.h[best_index].into()) {
                 break 'optimization_loop
             }
 
@@ -339,7 +331,7 @@ impl Normest1 {
                 self.indices.sort_unstable_by(|i, j| h_ref[*j].cmp(&h_ref[*i]));
             }
 
-            self.x_matrix.fill(0.0);
+            self.x_matrix.fill(T::zero());
             if t > 1 {
                 // > Replace ind(1:t) by the first t indices in ind(1:n) that are not in ind_hist.
                 //
@@ -370,11 +362,11 @@ impl Normest1 {
                 for i in (&mut index_iterator).take(t) {
                     if !self.indices_history.contains(i) {
                         all_first_t_in_history = false;
-                        self.x_matrix[(*i, current_column_fresh)] = 1.0;
+                        self.x_matrix[(*i, current_column_fresh)] = T::one();
                         current_column_fresh += 1;
                         self.indices_history.insert(*i);
                     } else if current_column_historical < t {
-                        self.x_matrix[(*i, current_column_historical)] = 1.0;
+                        self.x_matrix[(*i, current_column_historical)] = T::one();
                         current_column_historical += 1;
                     }
                 }
@@ -390,11 +382,11 @@ impl Normest1 {
                         break 'fill_x;
                     }
                     if !self.indices_history.contains(i) {
-                        self.x_matrix[(*i, current_column_fresh)] = 1.0;
+                        self.x_matrix[(*i, current_column_fresh)] = T::one();
                         current_column_fresh += 1;
                         self.indices_history.insert(*i);
                     } else if current_column_historical < t {
-                        self.x_matrix[(*i, current_column_historical)] = 1.0;
+                        self.x_matrix[(*i, current_column_historical)] = T::one();
                         current_column_historical += 1;
                     }
                 }
@@ -405,22 +397,22 @@ impl Normest1 {
     }
 
     /// Estimate the 1-norm of matrix `a` using up to `itmax` iterations.
-    pub fn normest1<S>(&mut self, a: &ArrayBase<S, Ix2>, itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    pub fn normest1<S>(&mut self, a: &ArrayBase<S, Ix2>, itmax: usize) -> T::RealField
+        where S: Data<Elem=T>,
     {
         self.calculate(a, itmax)
     }
 
     /// Estimate the 1-norm of a marix `a` to the power `m` up to `itmax` iterations.
-    pub fn normest1_pow<S>(&mut self, a: &ArrayBase<S, Ix2>, m: usize, itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    pub fn normest1_pow<S>(&mut self, a: &ArrayBase<S, Ix2>, m: usize, itmax: usize) -> T::RealField
+        where S: Data<Elem=T>,
     {
         self.calculate(&(a, m), itmax)
     }
 
     /// Estimate the 1-norm of a product of matrices `a1 a2 ... an` up to `itmax` iterations.
-    pub fn normest1_prod<S>(&mut self, aprod: &[&ArrayBase<S, Ix2>], itmax: usize) -> f64
-        where S: Data<Elem=f64>,
+    pub fn normest1_prod<S>(&mut self, aprod: &[&ArrayBase<S, Ix2>], itmax: usize) -> T::RealField
+        where S: Data<Elem=T>,
     {
         self.calculate(aprod, itmax)
     }
@@ -436,12 +428,12 @@ impl Normest1 {
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
 /// [`Normest1`]: struct.Normest1.html
-pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
+pub fn normest1<T: BlasScalar>(a_matrix: &Array2<T>, t: usize, itmax: usize) -> T::RealField
 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
     let n = a_matrix.dim().1;
-    let mut normest1 = Normest1::new(n, t);
+    let mut normest1 : Normest1<T> = Normest1::new(n, t);
     normest1.normest1(a_matrix, itmax)
 }
 
@@ -454,7 +446,7 @@ pub fn normest1(a_matrix: &Array2<f64>, t: usize, itmax: usize) -> f64
 /// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) -> f64
+pub fn normest1_pow<T: BlasScalar>(a_matrix: &Array2<T>, m: usize, t: usize, itmax: usize) -> T::RealField
 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
@@ -473,7 +465,7 @@ pub fn normest1_pow(a_matrix: &Array2<f64>, m: usize, t: usize, itmax: usize) ->
 /// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64
+pub fn normest1_prod<T: BlasScalar>(a_matrices: &[&Array2<T>], t: usize, itmax: usize) -> T::RealField
 {
     assert!(a_matrices.len() > 0);
     let n = a_matrices[0].dim().1;
@@ -485,9 +477,9 @@ pub fn normest1_prod(a_matrices: &[&Array2<f64>], t: usize, itmax: usize) -> f64
 ///
 /// Panics if matrices `a` and `b` have different shape and strides, or if either underlying array is
 /// non-contiguous. This is to make sure that the iteration order over the matrices is the same.
-fn assign_signum_of_array<S1, S2, D>(a: &ArrayBase<S1, D>, b: &mut ArrayBase<S2, D>)
-    where S1: Data<Elem=f64>,
-          S2: DataMut<Elem=f64>,
+fn assign_signum_of_array<S1, S2, D, T: BlasScalar>(a: &ArrayBase<S1, D>, b: &mut ArrayBase<S2, D>)
+    where S1: Data<Elem=T>,
+          S2: DataMut<Elem=T>,
           D: Dimension
 {
     assert_eq!(a.strides(), b.strides());
@@ -498,15 +490,15 @@ fn assign_signum_of_array<S1, S2, D>(a: &ArrayBase<S1, D>, b: &mut ArrayBase<S2,
     signum_of_slice(a_slice, b_slice);
 }
 
-fn signum_of_slice(source: &[f64], destination: &mut [f64]) {
+fn signum_of_slice<T: BlasScalar>(source: &[T], destination: &mut [T]) {
     for (s, d) in source.iter().zip(destination) {
         *d = s.signum();
     }
 }
 
 /// Calculate the onenorm of a vector (an `ArrayBase` with dimension `Ix1`).
-fn vector_onenorm<S>(a: &ArrayBase<S, Ix1>) -> f64
-    where S: Data<Elem=f64>,
+fn vector_onenorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
+    where S: Data<Elem=T>,
 {
     let stride = a.strides()[0];
     assert!(stride >= 0);
@@ -517,15 +509,15 @@ fn vector_onenorm<S>(a: &ArrayBase<S, Ix1>) -> f64
         let total_len = n_elements * stride;
         unsafe { slice::from_raw_parts(a, total_len) }
     };
-
-    unsafe {
-        cblas::dasum(n_elements as i32, a_slice, stride as i32)
-    }
+    T::asum(n_elements as i32, a_slice, stride as i32)
+//    unsafe {
+//        cblas::dasum(n_elements as i32, a_slice, stride as i32)
+//    }
 }
 
 /// Calculate the maximum norm of a vector (an `ArrayBase` with dimension `Ix1`).
-fn vector_maxnorm<S>(a: &ArrayBase<S, Ix1>) -> f64
-    where S: Data<Elem=f64>
+fn vector_maxnorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
+    where S: Data<Elem=T>
 {
     let stride = a.strides()[0];
     assert!(stride >= 0);
@@ -536,15 +528,15 @@ fn vector_maxnorm<S>(a: &ArrayBase<S, Ix1>) -> f64
         let total_len = n_elements * stride;
         unsafe { slice::from_raw_parts(a, total_len) }
     };
-
-    let idx = unsafe {
-        cblas::idamax(
-            n_elements as i32,
-            a_slice,
-            stride as i32,
-        ) as usize
-    };
-    f64::abs(a[idx])
+    let idx = T::amax(n_elements as i32, a_slice, stride as i32) as usize;
+//    let idx = unsafe {
+//        cblas::idamax(
+//            n_elements as i32,
+//            a_slice,
+//            stride as i32,
+//        ) as usize
+//    };
+    T::abs(a[idx])
 }
 
 // /// Calculate the onenorm of a matrix (an `ArrayBase` with dimension `Ix2`).
@@ -579,10 +571,11 @@ fn vector_maxnorm<S>(a: &ArrayBase<S, Ix1>) -> f64
 
 /// Returns the one-norm of a matrix `a` together with the index of that column for
 /// which the norm is maximal.
-fn matrix_onenorm_with_index<S>(a: &ArrayBase<S, Ix2>) -> (usize, f64)
-    where S: Data<Elem=f64>,
+fn matrix_onenorm_with_index<S, T: BlasScalar>(a: &ArrayBase<S, Ix2>) -> (usize, T::RealField)
+    where S: Data<Elem=T>,
 {
-    let mut max_norm = 0.0;
+    //todo:
+    let mut max_norm : T::RealField = <T::RealField as Zero>::zero();
     let mut max_norm_index = 0;
     for (i, column) in a.gencolumns().into_iter().enumerate() {
         let norm = vector_onenorm(&column);
@@ -606,13 +599,13 @@ fn matrix_onenorm_with_index<S>(a: &ArrayBase<S, Ix2>) -> (usize, f64)
 ///
 /// Panics if arrays `a` and `c` don't have the same dimensions, or if the length of the slice
 /// `column_is_parallel` is not equal to the number of columns in `a`.
-fn find_parallel_columns_in<S1, S2> (
+fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
     a: &ArrayBase<S1, Ix2>,
     c: &mut ArrayBase<S2, Ix2>,
     column_is_parallel: &mut [bool]
 )
-    where S1: Data<Elem=f64>,
-          S2: DataMut<Elem=f64>
+    where S1: Data<Elem=T>,
+          S2: DataMut<Elem=T>
 {
     let a_dim = a.dim();
     let c_dim = c.dim();
@@ -653,21 +646,32 @@ fn find_parallel_columns_in<S1, S2> (
             cblas::Layout::ColumnMajor => (n_cols, n_rows),
             cblas::Layout::RowMajor => (n_rows, n_cols),
         };
-        unsafe {
-            cblas::dsyrk(
-                layout,
+        T::syrk(layout,
                 cblas::Part::Upper,
-                cblas::Transpose::Ordinary,
+                cblas::Transpose::Conjugate,
                 n_cols as i32,
                 k as i32,
-                1.0,
+                T::from_subset(&1.0),
                 a_slice,
                 lda as i32,
-                0.0,
+                T::zero(),
                 c_slice,
-                n_cols as i32,
-            );
-        }
+                n_cols as i32,);
+//        unsafe {
+//            cblas::dsyrk(
+//                layout,
+//                cblas::Part::Upper,
+//                cblas::Transpose::Ordinary,
+//                n_cols as i32,
+//                k as i32,
+//                1.0,
+//                a_slice,
+//                lda as i32,
+//                0.0,
+//                c_slice,
+//                n_cols as i32,
+//            );
+//       }
     }
 
     // c is upper triangular and contains all pair-wise vector products:
@@ -685,7 +689,7 @@ fn find_parallel_columns_in<S1, S2> (
         if column_is_parallel[i] || i >= n_cols - 1 { continue 'rows; }
         for (j, element) in row.slice(s![i+1..]).iter().enumerate() {
             // Check if the vectors are parallel or anti-parallel
-            if f64::abs(*element) == n_rows as f64 {
+            if T::abs(*element).to_subset().unwrap() == n_rows as f64 {
                 column_is_parallel[i+j+1] = true;
             }
         }
@@ -707,15 +711,15 @@ fn find_parallel_columns_in<S1, S2> (
 ///
 /// Panics if arrays `a`, `b`, and `c` don't have the same dimensions, or if the length of the slice
 /// `column_is_parallel` is not equal to the number of columns in `a`.
-fn find_parallel_columns_between<S1, S2, S3> (
+fn find_parallel_columns_between<S1, S2, S3, T: BlasScalar> (
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
     c: &mut ArrayBase<S3, Ix2>,
     column_is_parallel: &mut [bool],
 )
-    where S1: Data<Elem=f64>,
-          S2: Data<Elem=f64>,
-          S3: DataMut<Elem=f64>
+    where S1: Data<Elem=T>,
+          S2: Data<Elem=T>,
+          S3: DataMut<Elem=T>
 {
     let a_dim = a.dim();
     let b_dim = b.dim();
@@ -738,24 +742,28 @@ fn find_parallel_columns_between<S1, S2, S3> (
 
         let layout = a_layout;
 
-        unsafe {
-            cblas::dgemm(
-                layout,
-                cblas::Transpose::Ordinary,
-                cblas::Transpose::None,
-                n_cols as i32,
-                n_cols as i32,
-                n_rows as i32,
-                1.0,
-                a_slice,
-                n_cols as i32,
-                b_slice,
-                n_cols as i32,
-                0.0,
-                c_slice,
-                n_cols as i32,
-            );
-        }
+        T::gemm(layout, cblas::Transpose::Conjugate, cblas::Transpose::None,
+                n_cols as i32, n_cols as i32, n_rows as i32,
+                T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
+                T::zero(), c_slice, n_cols as i32);
+//        unsafe {
+//            cblas::dgemm(
+//                layout,
+//                cblas::Transpose::Ordinary,
+//                cblas::Transpose::None,
+//                n_cols as i32,
+//                n_cols as i32,
+//                n_rows as i32,
+//                1.0,
+//                a_slice,
+//                n_cols as i32,
+//                b_slice,
+//                n_cols as i32,
+//                0.0,
+//                c_slice,
+//                n_cols as i32,
+//            );
+//        }
     }
 
     // We are iterating over the rows because it's more memory efficient (for row-major array).  In
@@ -767,7 +775,7 @@ fn find_parallel_columns_between<S1, S2, S3> (
         // Skip if the column is already found to be parallel the last column.
         if column_is_parallel[i] { continue 'rows; }
         for element in row {
-            if f64::abs(*element) == n_rows as f64 {
+            if T::abs(*element).to_subset().unwrap() == n_rows as f64 {
                 column_is_parallel[i] = true;
                 continue 'rows;
             }
@@ -780,13 +788,13 @@ fn find_parallel_columns_between<S1, S2, S3> (
 ///
 /// Assumes that we have parallelity only if all entries of two columns `a` and `b` are either +1
 /// or -1.
-fn are_all_columns_parallel_between<S1, S2> (
+fn are_all_columns_parallel_between<S1, S2, T: BlasScalar> (
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S1, Ix2>,
     c: &mut ArrayBase<S2, Ix2>,
 ) -> bool
-    where S1: Data<Elem=f64>,
-          S2: DataMut<Elem=f64>
+    where S1: Data<Elem=T>,
+          S2: DataMut<Elem=T>
 {
     let a_dim = a.dim();
     let b_dim = b.dim();
@@ -806,25 +814,28 @@ fn are_all_columns_parallel_between<S1, S2> (
         assert_eq!(a_layout, c_layout);
 
         let layout = a_layout;
-
-        unsafe {
-            cblas::dgemm(
-                layout,
-                cblas::Transpose::Ordinary,
-                cblas::Transpose::None,
-                n_cols as i32,
-                n_cols as i32,
-                n_rows as i32,
-                1.0,
-                a_slice,
-                n_cols as i32,
-                b_slice,
-                n_cols as i32,
-                0.0,
-                c_slice,
-                n_rows as i32,
-            );
-        }
+        T::gemm(layout, cblas::Transpose::Conjugate, cblas::Transpose::None,
+                n_cols as i32, n_cols as i32, n_rows as i32,
+                T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
+                T::zero(), c_slice, n_rows as i32,);
+//        unsafe {
+//            cblas::dgemm(
+//                layout,
+//                cblas::Transpose::Ordinary,
+//                cblas::Transpose::None,
+//                n_cols as i32,
+//                n_cols as i32,
+//                n_rows as i32,
+//                1.0,
+//                a_slice,
+//                n_cols as i32,
+//                b_slice,
+//                n_cols as i32,
+//                0.0,
+//                c_slice,
+//                n_rows as i32,
+//            );
+//        }
     }
 
     // We are iterating over the rows because it's more memory efficient (for row-major array).  In
@@ -834,7 +845,7 @@ fn are_all_columns_parallel_between<S1, S2> (
     'rows: for row in c.genrows() {
         for element in row {
             // If a parallel column was found, cut to the next one.
-            if f64::abs(*element) == n_rows as f64 { continue 'rows; }
+            if T::abs(*element).to_subset().unwrap() == n_rows as f64 { continue 'rows; }
         }
         // This return statement should only be reached if not a single column parallel to the
         // current one was found.
@@ -845,17 +856,17 @@ fn are_all_columns_parallel_between<S1, S2> (
 
 /// Find parallel columns in matrix `a` and columns in `a` that are parallel to any columns in
 /// matrix `b`, and replace those with random vectors. Returns `true` if resampling has taken place.
-fn resample_parallel_columns<S1, S2, S3, R>(
+fn resample_parallel_columns<S1, S2, S3, R, T: BlasScalar>(
     a: &mut ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
     c: &mut ArrayBase<S3, Ix2>,
     column_is_parallel: &mut [bool],
     rng: &mut R,
-    sample: &[f64],
+    sample: &[T],
 ) -> bool
-    where S1: DataMut<Elem=f64>,
-          S2: Data<Elem=f64>,
-          S3: DataMut<Elem=f64>,
+    where S1: DataMut<Elem=T>,
+          S2: Data<Elem=T>,
+          S3: DataMut<Elem=T>,
           R: Rng
 {
     column_is_parallel.iter_mut().for_each(|x| {*x = false;});
@@ -874,8 +885,12 @@ fn resample_parallel_columns<S1, S2, S3, R>(
 /// Resamples column `i` of matrix `a` with elements drawn from `sample` using `rng`.
 ///
 /// Panics if `i` exceeds the number of columns in `a`.
-fn resample_column<R, S>(a: &mut ArrayBase<S, Ix2>, i: usize, rng: &mut R, sample: &[f64])
-    where S: DataMut<Elem=f64>,
+fn resample_column<R, S, T: BlasScalar>(
+    a: &mut ArrayBase<S, Ix2>,
+    i: usize, rng:
+    &mut R, sample: &[T]
+)
+    where S: DataMut<Elem=T>,
           R: Rng
 {
     assert!(i < a.dim().1, "Trying to resample column with index exceeding matrix dimensions");
