@@ -13,7 +13,7 @@ use ndarray::{
     Ix2,
     s,
 };
-use num_traits::{Float, Zero};
+use num_traits::{Float, Zero, One};
 use ordered_float::NotNan;
 use rand::{
     Rng,
@@ -282,17 +282,18 @@ impl<T: BlasScalar> Normest1<T> {
                 // > or to a column of Sold by replacing columns of S by rand{-1,+1}
                 //
                 // NOTE: We are reusing `y_matrix` here as a temporary value.
-                // Note: Parallel column test can be skipped in complex case
-                if TypeId::of::<T>() == TypeId::of::<f32>() || TypeId::of::<T>() == TypeId::of::<f64>(){
-                    resample_parallel_columns(
-                        &mut self.sign_matrix,
-                        &self.sign_matrix_old,
-                        &mut self.y_matrix,
-                        &mut self.column_is_parallel,
-                        &mut self.rng,
-                        &sample,
-                    );
-                }
+                // Note: could the parallel column test be skipped in complex case?
+                //    may cause a few ulps difference
+                //if TypeId::of::<T>() == TypeId::of::<f32>() || TypeId::of::<T>() == TypeId::of::<f64>(){
+                resample_parallel_columns(
+                    &mut self.sign_matrix,
+                    &self.sign_matrix_old,
+                    &mut self.y_matrix,
+                    &mut self.column_is_parallel,
+                    &mut self.rng,
+                    &sample,
+                );
+                //}
             }
 
             // > est_old = est, Sold = S
@@ -646,16 +647,15 @@ fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
             cblas::Layout::ColumnMajor => (n_cols, n_rows),
             cblas::Layout::RowMajor => (n_rows, n_cols),
         };
-        T::syrk(layout,
+        T::herk(layout,
                 cblas::Part::Upper,
-            //All entries are assumed to be real, so herk w/ conj trans is not necessary
-                cblas::Transpose::Ordinary,
+                cblas::Transpose::Conjugate,
                 n_cols as i32,
                 k as i32,
-                T::from_subset(&1.0),
+                T::RealField::one(),
                 a_slice,
                 lda as i32,
-                T::zero(),
+                T::RealField::zero(),
                 c_slice,
                 n_cols as i32,);
     }
