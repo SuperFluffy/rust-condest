@@ -1,8 +1,9 @@
 //! This crate implements the matrix 1-norm estimator by [Higham and Tisseur].
 //!
 //! [Higham and Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-use alga::general::{ComplexField, SupersetOf};
-use blas_traits::BlasScalar;
+use alga::general::SupersetOf;
+use lapack_traits::BlasScalar;
+
 use ndarray::{
     prelude::*,
     ArrayBase,
@@ -13,7 +14,7 @@ use ndarray::{
     Ix2,
     s,
 };
-use num_traits::{Float, Zero, One};
+use num_traits::{Zero, One};
 use ordered_float::NotNan;
 use rand::{
     Rng,
@@ -24,7 +25,6 @@ use rand_xoshiro::Xoshiro256StarStar;
 use std::collections::BTreeSet;
 use std::cmp;
 use std::slice;
-use std::any::TypeId;
 
 pub struct Normest1<T: BlasScalar> where {
     n: usize,
@@ -530,13 +530,7 @@ fn vector_maxnorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
         unsafe { slice::from_raw_parts(a, total_len) }
     };
     let idx = T::amax(n_elements as i32, a_slice, stride as i32) as usize;
-//    let idx = unsafe {
-//        cblas::idamax(
-//            n_elements as i32,
-//            a_slice,
-//            stride as i32,
-//        ) as usize
-//    };
+
     T::abs(a[idx])
 }
 
@@ -732,24 +726,6 @@ fn find_parallel_columns_between<S1, S2, S3, T: BlasScalar> (
                 n_cols as i32, n_cols as i32, n_rows as i32,
                 T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
                 T::zero(), c_slice, n_cols as i32);
-//        unsafe {
-//            cblas::dgemm(
-//                layout,
-//                cblas::Transpose::Ordinary,
-//                cblas::Transpose::None,
-//                n_cols as i32,
-//                n_cols as i32,
-//                n_rows as i32,
-//                1.0,
-//                a_slice,
-//                n_cols as i32,
-//                b_slice,
-//                n_cols as i32,
-//                0.0,
-//                c_slice,
-//                n_cols as i32,
-//            );
-//        }
     }
 
     // We are iterating over the rows because it's more memory efficient (for row-major array).  In
@@ -804,24 +780,6 @@ fn are_all_columns_parallel_between<S1, S2, T: BlasScalar> (
                 n_cols as i32, n_cols as i32, n_rows as i32,
                 T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
                 T::zero(), c_slice, n_rows as i32,);
-//        unsafe {
-//            cblas::dgemm(
-//                layout,
-//                cblas::Transpose::Ordinary,
-//                cblas::Transpose::None,
-//                n_cols as i32,
-//                n_cols as i32,
-//                n_rows as i32,
-//                1.0,
-//                a_slice,
-//                n_cols as i32,
-//                b_slice,
-//                n_cols as i32,
-//                0.0,
-//                c_slice,
-//                n_rows as i32,
-//            );
-//        }
     }
 
     // We are iterating over the rows because it's more memory efficient (for row-major array).  In
@@ -1037,7 +995,7 @@ mod tests {
                 *u = *c / *e;
         });
 
-        let underestimation_mean = underestimation_ratio.mean_axis(Axis(0)).into_scalar();
+        let underestimation_mean = underestimation_ratio.mean_axis(Axis(0)).unwrap().into_scalar();
         assert!(0.99 < underestimation_mean);
         assert!(underestimation_mean < 1.0);
     }
