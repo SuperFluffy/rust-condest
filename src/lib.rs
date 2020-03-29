@@ -893,7 +893,7 @@ mod tests {
     use rand::{
         SeedableRng,
     };
-    use rand::distributions::StandardNormal;
+    use rand_distr::StandardNormal;
     use rand_xoshiro::Xoshiro256Plus;
 
     #[test]
@@ -905,7 +905,7 @@ mod tests {
         let mut rng = Xoshiro256Plus::seed_from_u64(1234);
         let distribution = StandardNormal;
 
-        let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
+        let mut a_matrix = Array2::<f64>::random_using((n, n), distribution, &mut rng);
         a_matrix.mapv_inplace(|x| 1.0/x);
 
         let unity = Array::eye(n);
@@ -927,7 +927,7 @@ mod tests {
         let mut rng = Xoshiro256Plus::seed_from_u64(1234);
         let distribution = StandardNormal;
 
-        let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
+        let mut a_matrix = Array2::<f64>::random_using((n, n), distribution, &mut rng);
         a_matrix.mapv_inplace(|x| 1.0/x);
 
         let estimate_matrixpow = crate::normest1_pow(&a_matrix, 2, t, itmax);
@@ -962,7 +962,7 @@ mod tests {
         let distribution = StandardNormal;
 
         for _ in 0..nsamples {
-            let mut a_matrix = Array::random_using((n, n), distribution, &mut rng);
+            let mut a_matrix = Array2::<f64>::random_using((n, n), distribution, &mut rng);
             a_matrix.mapv_inplace(|x| 1.0/x);
             let estimate = crate::normest1(&a_matrix, t, itmax);
             calculated.push(estimate);
@@ -984,8 +984,8 @@ mod tests {
             });
         }
 
-        let calculated = Array1::from_vec(calculated);
-        let expected = Array1::from_vec(expected);
+        let calculated = Array1::from(calculated);
+        let expected = Array1::from(expected);
 
         let mut underestimation_ratio = unsafe { Array1::<f64>::uninitialized(nsamples) };
         Zip::from(&calculated)
