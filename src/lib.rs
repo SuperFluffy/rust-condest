@@ -98,10 +98,12 @@ impl<S1, T: BlasScalar> LinearOperator<T> for ArrayBase<S1, Ix2>
         } else {
             cblas::Transpose::None
         };
-        T::gemm(layout, a_transpose, cblas::Transpose::None,
-                 n as i32, t as i32, n as i32,
-                 T::from_subset(&1.0), a_slice, n as i32, b_slice, t as i32,
-                 T::from_subset(&0.0), c_slice, t as i32,);
+        unsafe{
+            T::gemm(layout, a_transpose, cblas::Transpose::None,
+                     n as i32, t as i32, n as i32,
+                     T::from_subset(&1.0), a_slice, n as i32, b_slice, t as i32,
+                     T::from_subset(&0.0), c_slice, t as i32,);
+        }
     }
 }
 
@@ -510,10 +512,10 @@ fn vector_onenorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
         let total_len = n_elements * stride;
         unsafe { slice::from_raw_parts(a, total_len) }
     };
-    T::asum(n_elements as i32, a_slice, stride as i32)
-//    unsafe {
-//        cblas::dasum(n_elements as i32, a_slice, stride as i32)
-//    }
+
+    unsafe{
+        T::asum(n_elements as i32, a_slice, stride as i32)
+    }
 }
 
 /// Calculate the maximum norm of a vector (an `ArrayBase` with dimension `Ix1`).
@@ -529,7 +531,7 @@ fn vector_maxnorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
         let total_len = n_elements * stride;
         unsafe { slice::from_raw_parts(a, total_len) }
     };
-    let idx = T::amax(n_elements as i32, a_slice, stride as i32) as usize;
+    let idx = unsafe{ T::amax(n_elements as i32, a_slice, stride as i32) } as usize;
 
     T::abs(a[idx])
 }
@@ -641,17 +643,19 @@ fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
             cblas::Layout::ColumnMajor => (n_cols, n_rows),
             cblas::Layout::RowMajor => (n_rows, n_cols),
         };
-        T::herk(layout,
-                cblas::Part::Upper,
-                cblas::Transpose::Conjugate,
-                n_cols as i32,
-                k as i32,
-                T::RealField::one(),
-                a_slice,
-                lda as i32,
-                T::RealField::zero(),
-                c_slice,
-                n_cols as i32,);
+        unsafe{
+            T::herk(layout,
+                    cblas::Part::Upper,
+                    cblas::Transpose::Conjugate,
+                    n_cols as i32,
+                    k as i32,
+                    T::RealField::one(),
+                    a_slice,
+                    lda as i32,
+                    T::RealField::zero(),
+                    c_slice,
+                    n_cols as i32,);
+        }
     }
 
     // c is upper triangular and contains all pair-wise vector products:
@@ -722,10 +726,12 @@ fn find_parallel_columns_between<S1, S2, S3, T: BlasScalar> (
 
         let layout = a_layout;
 
-        T::gemm(layout, cblas::Transpose::Conjugate, cblas::Transpose::None,
+        unsafe{
+            T::gemm(layout, cblas::Transpose::Conjugate, cblas::Transpose::None,
                 n_cols as i32, n_cols as i32, n_rows as i32,
                 T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
                 T::zero(), c_slice, n_cols as i32);
+        }
     }
 
     // We are iterating over the rows because it's more memory efficient (for row-major array).  In
@@ -776,10 +782,12 @@ fn are_all_columns_parallel_between<S1, S2, T: BlasScalar> (
         assert_eq!(a_layout, c_layout);
 
         let layout = a_layout;
-        T::gemm(layout, cblas::Transpose::Conjugate, cblas::Transpose::None,
-                n_cols as i32, n_cols as i32, n_rows as i32,
-                T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
-                T::zero(), c_slice, n_rows as i32,);
+        unsafe{
+            T::gemm(layout, cblas::Transpose::Conjugate, cblas::Transpose::None,
+                    n_cols as i32, n_cols as i32, n_rows as i32,
+                    T::one(), a_slice, n_cols as i32, b_slice, n_cols as i32,
+                    T::zero(), c_slice, n_rows as i32,);
+        }
     }
 
     // We are iterating over the rows because it's more memory efficient (for row-major array).  In
