@@ -1,8 +1,7 @@
 //! This crate implements the matrix 1-norm estimator by [Higham and Tisseur].
 //!
 //! [Higham and Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-use alga::general::SupersetOf;
-use lapack_traits::BlasScalar;
+use lapack_traits::{BlasScalar, SupersetOf};
 
 use ndarray::{
     prelude::*,
