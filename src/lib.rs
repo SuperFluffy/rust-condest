@@ -1,7 +1,8 @@
 //! This crate implements the matrix 1-norm estimator by [Higham and Tisseur].
 //!
 //! [Higham and Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-use lapack_traits::{BlasScalar, SupersetOf};
+use lapack_traits::LComplexField;
+use simba::scalar::SupersetOf;
 
 use ndarray::{
     prelude::*,
@@ -25,7 +26,7 @@ use std::collections::BTreeSet;
 use std::cmp;
 use std::slice;
 
-pub struct Normest1<T: BlasScalar> where {
+pub struct Normest1<T: LComplexField> where {
     n: usize,
     t: usize,
     rng: Xoshiro256StarStar,
@@ -58,12 +59,12 @@ pub struct Normest1<T: BlasScalar> where {
 ///
 /// It is at the designation of the user to check what is more efficient: to pass in one definite
 /// matrix or choose the alternative route described here.
-trait LinearOperator<T: BlasScalar> {
+trait LinearOperator<T: LComplexField> {
     fn multiply_matrix<S>(&self, b: &mut ArrayBase<S, Ix2>, c: &mut ArrayBase<S, Ix2>, transpose: bool)
         where S: DataMut<Elem=T>;
 }
 
-impl<S1, T: BlasScalar> LinearOperator<T> for ArrayBase<S1, Ix2>
+impl<S1, T: LComplexField> LinearOperator<T> for ArrayBase<S1, Ix2>
     where S1: Data<Elem=T>,
 {
     fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
@@ -106,7 +107,7 @@ impl<S1, T: BlasScalar> LinearOperator<T> for ArrayBase<S1, Ix2>
     }
 }
 
-impl<S1, T: BlasScalar> LinearOperator<T> for [&ArrayBase<S1, Ix2>]
+impl<S1, T: LComplexField> LinearOperator<T> for [&ArrayBase<S1, Ix2>]
     where S1: Data<Elem=T>
 {
     fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase<S2, Ix2>, transpose: bool)
@@ -140,7 +141,7 @@ impl<S1, T: BlasScalar> LinearOperator<T> for [&ArrayBase<S1, Ix2>]
     }
 }
 
-impl<S1, T: BlasScalar> LinearOperator<T> for (&ArrayBase<S1, Ix2>, usize)
+impl<S1, T: LComplexField> LinearOperator<T> for (&ArrayBase<S1, Ix2>, usize)
     where S1: Data<Elem=T>
 {
     fn multiply_matrix<S2>(&self, b: &mut ArrayBase<S2, Ix2>, c: &mut ArrayBase< S2, Ix2>, transpose: bool)
@@ -158,7 +159,7 @@ impl<S1, T: BlasScalar> LinearOperator<T> for (&ArrayBase<S1, Ix2>, usize)
     }
 }
 
-impl<T: BlasScalar> Normest1<T> {
+impl<T: LComplexField> Normest1<T> {
     pub fn new(n: usize, t: usize) -> Self {
         assert!(t <= n, "Cannot have more iteration columns t than columns in the matrix.");
         let rng = Xoshiro256StarStar::from_rng(&mut thread_rng()).expect("Rng initialization failed.");
@@ -221,7 +222,7 @@ impl<T: BlasScalar> Normest1<T> {
         // lessens the importance of counterexamples (see the comments in the next section).”
         {
             let rng_mut = &mut self.rng;
-            self.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0, sample.len())] );
+            self.x_matrix.mapv_inplace(|_| sample[rng_mut.gen_range(0..sample.len())] );
             self.x_matrix.column_mut(0).fill(T::one());
         }
 
@@ -430,7 +431,7 @@ impl<T: BlasScalar> Normest1<T> {
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
 /// [`Normest1`]: struct.Normest1.html
-pub fn normest1<T: BlasScalar>(a_matrix: &Array2<T>, t: usize, itmax: usize) -> T::RealField
+pub fn normest1<T: LComplexField>(a_matrix: &Array2<T>, t: usize, itmax: usize) -> T::RealField
 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
@@ -448,7 +449,7 @@ pub fn normest1<T: BlasScalar>(a_matrix: &Array2<T>, t: usize, itmax: usize) -> 
 /// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_pow<T: BlasScalar>(a_matrix: &Array2<T>, m: usize, t: usize, itmax: usize) -> T::RealField
+pub fn normest1_pow<T: LComplexField>(a_matrix: &Array2<T>, m: usize, t: usize, itmax: usize) -> T::RealField
 {
     // Assume the matrix is square and take the columns as n. If it's not square, the assertion in
     // normest.calculate will fail.
@@ -467,7 +468,7 @@ pub fn normest1_pow<T: BlasScalar>(a_matrix: &Array2<T>, m: usize, t: usize, itm
 /// 1-norm on matrices of the same size, construct a [`Normest1`] first, and call its methods.
 ///
 /// [Higham, Tisseur]: http://eprints.ma.man.ac.uk/321/1/covered/MIMS_ep2006_145.pdf
-pub fn normest1_prod<T: BlasScalar>(a_matrices: &[&Array2<T>], t: usize, itmax: usize) -> T::RealField
+pub fn normest1_prod<T: LComplexField>(a_matrices: &[&Array2<T>], t: usize, itmax: usize) -> T::RealField
 {
     assert!(a_matrices.len() > 0);
     let n = a_matrices[0].dim().1;
@@ -479,7 +480,7 @@ pub fn normest1_prod<T: BlasScalar>(a_matrices: &[&Array2<T>], t: usize, itmax: 
 ///
 /// Panics if matrices `a` and `b` have different shape and strides, or if either underlying array is
 /// non-contiguous. This is to make sure that the iteration order over the matrices is the same.
-fn assign_signum_of_array<S1, S2, D, T: BlasScalar>(a: &ArrayBase<S1, D>, b: &mut ArrayBase<S2, D>)
+fn assign_signum_of_array<S1, S2, D, T: LComplexField>(a: &ArrayBase<S1, D>, b: &mut ArrayBase<S2, D>)
     where S1: Data<Elem=T>,
           S2: DataMut<Elem=T>,
           D: Dimension
@@ -492,14 +493,14 @@ fn assign_signum_of_array<S1, S2, D, T: BlasScalar>(a: &ArrayBase<S1, D>, b: &mu
     signum_of_slice(a_slice, b_slice);
 }
 
-fn signum_of_slice<T: BlasScalar>(source: &[T], destination: &mut [T]) {
+fn signum_of_slice<T: LComplexField>(source: &[T], destination: &mut [T]) {
     for (s, d) in source.iter().zip(destination) {
         *d = s.signum();
     }
 }
 
 /// Calculate the onenorm of a vector (an `ArrayBase` with dimension `Ix1`).
-fn vector_onenorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
+fn vector_onenorm<S, T: LComplexField>(a: &ArrayBase<S, Ix1>) -> T::RealField
     where S: Data<Elem=T>,
 {
     let stride = a.strides()[0];
@@ -518,7 +519,7 @@ fn vector_onenorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
 }
 
 /// Calculate the maximum norm of a vector (an `ArrayBase` with dimension `Ix1`).
-fn vector_maxnorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
+fn vector_maxnorm<S, T: LComplexField>(a: &ArrayBase<S, Ix1>) -> T::RealField
     where S: Data<Elem=T>
 {
     let stride = a.strides()[0];
@@ -567,7 +568,7 @@ fn vector_maxnorm<S, T: BlasScalar>(a: &ArrayBase<S, Ix1>) -> T::RealField
 
 /// Returns the one-norm of a matrix `a` together with the index of that column for
 /// which the norm is maximal.
-fn matrix_onenorm_with_index<S, T: BlasScalar>(a: &ArrayBase<S, Ix2>) -> (usize, T::RealField)
+fn matrix_onenorm_with_index<S, T: LComplexField>(a: &ArrayBase<S, Ix2>) -> (usize, T::RealField)
     where S: Data<Elem=T>,
 {
     //todo:
@@ -595,7 +596,7 @@ fn matrix_onenorm_with_index<S, T: BlasScalar>(a: &ArrayBase<S, Ix2>) -> (usize,
 ///
 /// Panics if arrays `a` and `c` don't have the same dimensions, or if the length of the slice
 /// `column_is_parallel` is not equal to the number of columns in `a`.
-fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
+fn find_parallel_columns_in<S1, S2, T: LComplexField> (
     a: &ArrayBase<S1, Ix2>,
     c: &mut ArrayBase<S2, Ix2>,
     column_is_parallel: &mut [bool]
@@ -694,7 +695,7 @@ fn find_parallel_columns_in<S1, S2, T: BlasScalar> (
 ///
 /// Panics if arrays `a`, `b`, and `c` don't have the same dimensions, or if the length of the slice
 /// `column_is_parallel` is not equal to the number of columns in `a`.
-fn find_parallel_columns_between<S1, S2, S3, T: BlasScalar> (
+fn find_parallel_columns_between<S1, S2, S3, T: LComplexField> (
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
     c: &mut ArrayBase<S3, Ix2>,
@@ -755,7 +756,7 @@ fn find_parallel_columns_between<S1, S2, S3, T: BlasScalar> (
 ///
 /// Assumes that we have parallelity only if all entries of two columns `a` and `b` are either +1
 /// or -1.
-fn are_all_columns_parallel_between<S1, S2, T: BlasScalar> (
+fn are_all_columns_parallel_between<S1, S2, T: LComplexField> (
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S1, Ix2>,
     c: &mut ArrayBase<S2, Ix2>,
@@ -807,7 +808,7 @@ fn are_all_columns_parallel_between<S1, S2, T: BlasScalar> (
 
 /// Find parallel columns in matrix `a` and columns in `a` that are parallel to any columns in
 /// matrix `b`, and replace those with random vectors. Returns `true` if resampling has taken place.
-fn resample_parallel_columns<S1, S2, S3, R, T: BlasScalar>(
+fn resample_parallel_columns<S1, S2, S3, R, T: LComplexField>(
     a: &mut ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
     c: &mut ArrayBase<S3, Ix2>,
@@ -836,7 +837,7 @@ fn resample_parallel_columns<S1, S2, S3, R, T: BlasScalar>(
 /// Resamples column `i` of matrix `a` with elements drawn from `sample` using `rng`.
 ///
 /// Panics if `i` exceeds the number of columns in `a`.
-fn resample_column<R, S, T: BlasScalar>(
+fn resample_column<R, S, T: LComplexField>(
     a: &mut ArrayBase<S, Ix2>,
     i: usize, rng:
     &mut R, sample: &[T]
@@ -846,7 +847,7 @@ fn resample_column<R, S, T: BlasScalar>(
 {
     assert!(i < a.dim().1, "Trying to resample column with index exceeding matrix dimensions");
     assert!(sample.len() > 0);
-    a.column_mut(i).mapv_inplace(|_| sample[rng.gen_range(0, sample.len())]);
+    a.column_mut(i).mapv_inplace(|_| sample[rng.gen_range(0..sample.len())]);
 }
 
 /// Returns slice and layout underlying an array `a`.
