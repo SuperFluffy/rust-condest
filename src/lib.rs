@@ -163,14 +163,15 @@ impl<T: LComplexField> Normest1<T> {
     pub fn new(n: usize, t: usize) -> Self {
         assert!(t <= n, "Cannot have more iteration columns t than columns in the matrix.");
         let rng = Xoshiro256StarStar::from_rng(&mut thread_rng()).expect("Rng initialization failed.");
-        let x_matrix = unsafe { Array2::uninitialized((n, t)) };
-        let y_matrix = unsafe { Array2::uninitialized((n, t)) };
-        let z_matrix = unsafe { Array2::uninitialized((n, t)) };
+        // safety: These arrays are always assigned to intermediate results
+        let x_matrix = unsafe { Array2::uninit((n, t)).assume_init() };
+        let y_matrix = unsafe { Array2::uninit((n, t)).assume_init() };
+        let z_matrix = unsafe { Array2::uninit((n, t)).assume_init() };
 
-        let w_vector = unsafe { Array1::uninitialized(n) };
+        let w_vector = unsafe { Array1::uninit(n).assume_init() };
 
-        let sign_matrix = unsafe { Array2::uninitialized((n, t)) };
-        let sign_matrix_old = unsafe { Array2::uninitialized((n, t)) };
+        let sign_matrix = unsafe { Array2::uninit((n, t)).assume_init() };
+        let sign_matrix_old = unsafe { Array2::uninit((n, t)).assume_init() };
 
         let column_is_parallel = vec![false; t];
 
@@ -314,7 +315,7 @@ impl<T: LComplexField> Normest1<T> {
 
             // hᵢ= ‖Z(i,:)‖_∞
             let mut max_h = T::RealField::zero();
-            for (row, h_element) in self.z_matrix.genrows().into_iter().zip(self.h.iter_mut()) {
+            for (row, h_element) in self.z_matrix.rows().into_iter().zip(self.h.iter_mut()) {
                 let h : T::RealField = vector_maxnorm(&row);
                 max_h = if h > max_h { h } else { max_h };
                 // Convert f64 to NotNan for using sort_unstable_by below
@@ -574,7 +575,7 @@ fn matrix_onenorm_with_index<S, T: LComplexField>(a: &ArrayBase<S, Ix2>) -> (usi
     //todo:
     let mut max_norm : T::RealField = <T::RealField as Zero>::zero();
     let mut max_norm_index = 0;
-    for (i, column) in a.gencolumns().into_iter().enumerate() {
+    for (i, column) in a.columns().into_iter().enumerate() {
         let norm = vector_onenorm(&column);
         if norm > max_norm {
             max_norm = norm;
@@ -667,7 +668,7 @@ fn find_parallel_columns_in<S1, S2, T: LComplexField> (
     // . . . . x
 
     // Don't check more rows than we have columns 
-    'rows: for (i, row) in c.genrows().into_iter().enumerate().take(n_cols) {
+    'rows: for (i, row) in c.rows().into_iter().enumerate().take(n_cols) {
         // Skip if the column is already found to be parallel or if we are checking
         // the last column
         if column_is_parallel[i] || i >= n_cols - 1 { continue 'rows; }
@@ -739,7 +740,7 @@ fn find_parallel_columns_between<S1, S2, S3, T: LComplexField> (
     // the outer loop) is parallel to any column of b (inner loop). By iterating via columns we would check if
     // any column of a is parallel to the, in that case, current column of b.
     // TODO:  Implement for column major arrays.
-    'rows: for (i, row) in c.genrows().into_iter().enumerate().take(n_cols) {
+    'rows: for (i, row) in c.rows().into_iter().enumerate().take(n_cols) {
         // Skip if the column is already found to be parallel the last column.
         if column_is_parallel[i] { continue 'rows; }
         for element in row {
@@ -794,7 +795,7 @@ fn are_all_columns_parallel_between<S1, S2, T: LComplexField> (
     // terms of logic there is no difference: we simply check if a specific column of a is parallel
     // to any column of b. By iterating via columns we would check if any column of a is parallel
     // to a specific column of b.
-    'rows: for row in c.genrows() {
+    'rows: for row in c.rows() {
         for element in row {
             // If a parallel column was found, cut to the next one.
             if T::abs(*element).to_subset().unwrap() == n_rows as f64 { continue 'rows; }
@@ -995,13 +996,14 @@ mod tests {
         let calculated = Array1::from(calculated);
         let expected = Array1::from(expected);
 
-        let mut underestimation_ratio = unsafe { Array1::<f64>::uninitialized(nsamples) };
+        let mut underestimation_ratio =   Array1::<f64>::uninit(nsamples);
         Zip::from(&calculated)
             .and(&expected)
             .and(&mut underestimation_ratio)
-            .apply(|c, e, u| {
-                *u = *c / *e;
+            .for_each(|c, e, u| {
+                unsafe { u.as_mut_ptr().write(*c / *e); }
         });
+        let underestimation_ratio = unsafe { underestimation_ratio.assume_init() };
 
         let underestimation_mean = underestimation_ratio.mean_axis(Axis(0)).unwrap().into_scalar();
         assert!(0.99 < underestimation_mean);
