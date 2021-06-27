@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::cmp;
 use std::slice;
 
-pub struct Normest1<T: LComplexField> where {
+pub struct Normest1<T: LComplexField> {
     n: usize,
     t: usize,
     rng: Xoshiro256StarStar,
