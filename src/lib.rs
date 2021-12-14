@@ -236,7 +236,7 @@ impl<T: LComplexField> Normest1<T> {
         }
 
         // Set all columns to unit vectors
-        self.x_matrix.mapv_inplace(|x| (x / T::from_usize(n).unwrap()) );
+        self.x_matrix.mapv_inplace(|x| (x / T::from_subset(&(n as f64))) );
 
         let mut estimate = T::RealField::zero();
         let mut best_index = 0;
@@ -317,7 +317,7 @@ impl<T: LComplexField> Normest1<T> {
             let mut max_h = T::RealField::zero();
             for (row, h_element) in self.z_matrix.rows().into_iter().zip(self.h.iter_mut()) {
                 let h : T::RealField = vector_maxnorm(&row);
-                max_h = if h > max_h { h } else { max_h };
+                max_h = if h > max_h { h.clone() } else { max_h };
                 // Convert f64 to NotNan for using sort_unstable_by below
                 *h_element = h.to_subset().unwrap().into();
             }

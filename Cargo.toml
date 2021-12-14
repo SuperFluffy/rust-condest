@@ -14,14 +14,14 @@ keywords = ["condition", "linalg", "matrix", "ndarray", "norm"]
 [dependencies]
 cblas = "0.4"
 lapacke = "0.5"
-lapack-traits = {version="0.3", features=["simba"]}
+lapack-traits = {version="0.4", features=["simba"]}
 ndarray = "0.15"
 num-traits = "0.2"
 ordered-float = "1.0"
 rand = "0.8"
 rand_distr = "0.4"
 rand_xoshiro = "0.6"
-simba="0.5"
+simba="0.6"
 
 #[patch.crates-io]
 #lapack-traits = {git="https://github.com/hmunozb/lapack-traits.git"}
